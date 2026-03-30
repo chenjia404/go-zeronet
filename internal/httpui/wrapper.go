@@ -40,7 +40,7 @@ var wrapperTemplate = template.Must(template.New("wrapper").Parse(`<!doctype htm
       <div class="title">{{.Title}}</div>
       <div class="badge">{{.SiteAddress}}</div>
     </div>
-    <iframe id="inner-iframe" sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-modals allow-downloads allow-pointer-lock allow-presentation" allow="fullscreen; unload" src="{{.IFrameURL}}"></iframe>
+    <iframe id="inner-iframe" sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-modals allow-downloads allow-pointer-lock allow-presentation allow-top-navigation-by-user-activation" allow="fullscreen; unload" src="{{.IFrameURL}}"></iframe>
   </div>
   <div class="toast-wrap" id="toast-wrap"></div>
   <script>

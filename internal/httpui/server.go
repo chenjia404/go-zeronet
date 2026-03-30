@@ -94,14 +94,18 @@ func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sess := s.newSession(siteAddress, innerPath)
-	query := cloneQuery(r.URL.Query())
-	query.Set("wrapper_nonce", sess.WrapperNonce)
 	iframeURL := "/media/" + siteAddress + "/" + strings.TrimPrefix(innerPath, "/")
 	if innerPath == "index.html" {
 		iframeURL = "/media/" + siteAddress + "/"
 	}
-	if encoded := query.Encode(); encoded != "" {
-		iframeURL += "?" + encoded
+	rawQuery := strings.TrimPrefix(r.URL.RawQuery, "?")
+	switch {
+	case rawQuery == "":
+		iframeURL += "?wrapper_nonce=" + url.QueryEscape(sess.WrapperNonce)
+	case strings.Contains(rawQuery, "wrapper_nonce="):
+		iframeURL += "?" + rawQuery
+	default:
+		iframeURL += "?" + rawQuery + "&wrapper_nonce=" + url.QueryEscape(sess.WrapperNonce)
 	}
 
 	info := s.manager.SiteInfo(siteAddress, "")
@@ -198,14 +202,6 @@ func randomToken(size int) string {
 		return fmt.Sprintf("%x", now)
 	}
 	return hex.EncodeToString(buf)
-}
-
-func cloneQuery(values url.Values) url.Values {
-	back := make(url.Values, len(values))
-	for key, items := range values {
-		back[key] = append([]string(nil), items...)
-	}
-	return back
 }
 
 func setCommonHeaders(w http.ResponseWriter) {
