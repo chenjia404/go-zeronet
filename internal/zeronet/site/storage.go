@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/chenjia404/go-zeronet/internal/zeronet/conn"
 )
@@ -23,15 +24,17 @@ type Manager struct {
 	mu        sync.Mutex
 	clients   map[string]*conn.Client
 	contents  map[string]map[string]*ContentJSON
+	lastCheck map[string]time.Time
 }
 
 // NewManager 创建站点管理器。
 func NewManager(dataDir string, peers []string) *Manager {
 	manager := &Manager{
-		dataDir:  dataDir,
-		peerSet:  make(map[string]struct{}),
-		clients:  make(map[string]*conn.Client),
-		contents: make(map[string]map[string]*ContentJSON),
+		dataDir:   dataDir,
+		peerSet:   make(map[string]struct{}),
+		clients:   make(map[string]*conn.Client),
+		contents:  make(map[string]map[string]*ContentJSON),
+		lastCheck: make(map[string]time.Time),
 	}
 	for _, peer := range peers {
 		manager.addPeer(peer)
@@ -68,9 +71,15 @@ func (m *Manager) OpenSiteFile(siteAddress, innerPath string) (string, error) {
 	if innerPath == "" {
 		innerPath = "index.html"
 	}
+
+	_ = m.refreshSite(siteAddress)
+
 	fullPath := m.siteFilePath(siteAddress, innerPath)
 	if _, err := os.Stat(fullPath); err == nil {
-		return fullPath, nil
+		valid, verifyErr := m.verifyLocalFile(siteAddress, innerPath)
+		if verifyErr == nil && valid {
+			return fullPath, nil
+		}
 	}
 
 	if _, err := m.EnsureRootContent(siteAddress); err != nil {
@@ -139,6 +148,55 @@ func (m *Manager) ensureContent(siteAddress, innerPath string) (*ContentJSON, er
 	}
 	m.setCachedContent(siteAddress, innerPath, content)
 	return content, nil
+}
+
+func (m *Manager) refreshSite(siteAddress string) error {
+	if !m.shouldRefresh(siteAddress) {
+		return nil
+	}
+
+	currentContent, _ := m.ensureContent(siteAddress, "content.json")
+	var since int64
+	if currentContent != nil {
+		since = currentContent.Modified - 1
+	}
+
+	var latestModified int64
+	for _, peer := range m.peers() {
+		client, err := m.clientForPeer(peer)
+		if err != nil {
+			continue
+		}
+		modifiedFiles, err := client.ListModified(siteAddress, since)
+		if err != nil {
+			m.dropClient(peer)
+			continue
+		}
+		if modified := modifiedFiles["content.json"]; modified > latestModified {
+			latestModified = modified
+		}
+	}
+
+	if currentContent != nil && latestModified <= currentContent.Modified {
+		return nil
+	}
+	if latestModified == 0 && currentContent != nil {
+		return nil
+	}
+
+	raw, err := m.fetchFromPeers(siteAddress, "content.json")
+	if err != nil {
+		return err
+	}
+	content, err := ParseContentJSON(siteAddress, "content.json", raw)
+	if err != nil {
+		return err
+	}
+	if err := m.writeSiteFile(siteAddress, "content.json", raw); err != nil {
+		return err
+	}
+	m.setCachedContent(siteAddress, "content.json", content)
+	return nil
 }
 
 func (m *Manager) lookupFile(siteAddress, innerPath string) (*ContentFile, error) {
@@ -213,6 +271,21 @@ func verifyFile(innerPath string, fileInfo *ContentFile, raw []byte) error {
 		return fmt.Errorf("%s 文件 sha512 校验失败: got=%s want=%s", innerPath, gotHash, wantHash)
 	}
 	return nil
+}
+
+func (m *Manager) verifyLocalFile(siteAddress, innerPath string) (bool, error) {
+	fileInfo, err := m.lookupFile(siteAddress, innerPath)
+	if err != nil {
+		return false, err
+	}
+	raw, err := os.ReadFile(m.siteFilePath(siteAddress, innerPath))
+	if err != nil {
+		return false, err
+	}
+	if err := verifyFile(innerPath, fileInfo, raw); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) {
@@ -373,6 +446,17 @@ func (m *Manager) setCachedContent(siteAddress, innerPath string, content *Conte
 		m.contents[siteAddress] = make(map[string]*ContentJSON)
 	}
 	m.contents[siteAddress][innerPath] = content
+}
+
+func (m *Manager) shouldRefresh(siteAddress string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lastCheck := m.lastCheck[siteAddress]
+	if time.Since(lastCheck) < 15*time.Second {
+		return false
+	}
+	m.lastCheck[siteAddress] = time.Now()
+	return true
 }
 
 func nthSlash(s string, n int) int {

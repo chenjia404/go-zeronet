@@ -39,6 +39,9 @@ type PeerAddress struct {
 	Port int
 }
 
+// ModifiedFilesResponse 保存 listModified 结果。
+type ModifiedFilesResponse map[string]int64
+
 // Dial 建立 TCP 连接并完成 ZeroNet v2 握手。
 func Dial(addr string) (*Client, error) {
 	netConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
@@ -221,6 +224,26 @@ func (c *Client) Pex(siteAddress string, knownPeers []PeerAddress, needNum int) 
 	return peers, nil
 }
 
+// ListModified 查询站点中自给定时间后的 content.json 修改时间。
+func (c *Client) ListModified(siteAddress string, since int64) (ModifiedFilesResponse, error) {
+	msg, err := c.request("listModified", protocol.Message{
+		"site":  siteAddress,
+		"since": since,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if errText, ok := msg["error"].(string); ok && errText != "" {
+		return nil, fmt.Errorf("peer 返回 listModified 错误: %s", errText)
+	}
+
+	modifiedFiles, ok := msg["modified_files"]
+	if !ok {
+		return nil, fmt.Errorf("listModified 响应缺少 modified_files")
+	}
+	return decodeModifiedFiles(modifiedFiles), nil
+}
+
 func (c *Client) request(cmd string, params protocol.Message) (protocol.Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -340,4 +363,25 @@ func decodePackedOnionPeers(raw any) []PeerAddress {
 		peers = append(peers, PeerAddress{IP: ip, Port: port})
 	}
 	return peers
+}
+
+func decodeModifiedFiles(raw any) ModifiedFilesResponse {
+	back := make(ModifiedFilesResponse)
+
+	switch val := raw.(type) {
+	case map[string]any:
+		for key, item := range val {
+			back[key] = toInt64(item)
+		}
+	case map[any]any:
+		for key, item := range val {
+			keyStr, ok := key.(string)
+			if !ok {
+				continue
+			}
+			back[keyStr] = toInt64(item)
+		}
+	}
+
+	return back
 }
