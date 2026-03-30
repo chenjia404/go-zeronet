@@ -57,7 +57,7 @@ func Run() error {
 	if reachableClient != nil {
 		manager.SetClient(reachablePeerAddr, reachableClient)
 	}
-	server := httpui.New(cfg.UIAddr, manager.NewFileHandler())
+	server := httpui.New(cfg.UIAddr, manager)
 
 	log.Printf("data dir: %s", cfg.DataDir)
 	log.Printf("bootstrap peers: %v", manager.BootstrapPeers())

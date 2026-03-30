@@ -1,7 +1,9 @@
 package site
 
 import (
+	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -137,6 +139,81 @@ func (m *Manager) NewFileHandler() http.Handler {
 		}
 		http.ServeFile(w, r, filePath)
 	})
+}
+
+// ReadSiteFile 读取站点文件，必要时自动下载。
+func (m *Manager) ReadSiteFile(siteAddress, innerPath, format string) (any, error) {
+	filePath, err := m.OpenSiteFile(siteAddress, innerPath)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if format == "base64" {
+		return base64.StdEncoding.EncodeToString(raw), nil
+	}
+	return string(raw), nil
+}
+
+// NeedFile 只确保文件存在，不返回内容。
+func (m *Manager) NeedFile(siteAddress, innerPath string) error {
+	_, err := m.OpenSiteFile(siteAddress, innerPath)
+	return err
+}
+
+// SiteInfo 返回 ZeroFrame 常用的站点元信息。
+func (m *Manager) SiteInfo(siteAddress, fileStatus string) map[string]any {
+	info := map[string]any{
+		"address":       siteAddress,
+		"address_short": shortAddress(siteAddress),
+		"address_hash":  hex.EncodeToString(sha256Sum(siteAddress)),
+		"peers":         len(m.peers()),
+		"settings": map[string]any{
+			"own":         false,
+			"permissions": []string{},
+			"serving":     true,
+		},
+		"bad_files": 0,
+	}
+
+	content, err := m.EnsureRootContent(siteAddress)
+	if err == nil && content != nil {
+		info["content"] = map[string]any{
+			"title":          content.Title,
+			"modified":       content.Modified,
+			"files":          len(content.Files),
+			"files_optional": len(content.FilesOptional),
+			"includes":       len(content.Includes),
+		}
+	}
+	if fileStatus != "" {
+		if _, err := os.Stat(m.siteFilePath(siteAddress, fileStatus)); err == nil {
+			info["event"] = []any{"file_done", fileStatus}
+		}
+	}
+	return info
+}
+
+// FileRules 返回最小 ZeroFrame 文件规则集合。
+func (m *Manager) FileRules(siteAddress, innerPath string) map[string]any {
+	fileInfo, err := m.lookupFile(siteAddress, innerPath)
+	if err != nil {
+		return map[string]any{
+			"current_size":     0,
+			"max_size":         10 * 1024 * 1024,
+			"signers":          []string{},
+			"includes_allowed": false,
+		}
+	}
+	return map[string]any{
+		"current_size":     fileInfo.Size,
+		"max_size":         10 * 1024 * 1024,
+		"signers":          []string{},
+		"includes_allowed": false,
+		"optional":         fileInfo.Optional,
+	}
 }
 
 func (m *Manager) ensureContent(siteAddress, innerPath string) (*ContentJSON, error) {
@@ -1058,6 +1135,18 @@ func optionalHashID(sha512hex string) (uint16, bool) {
 		return 0, false
 	}
 	return uint16(value), true
+}
+
+func shortAddress(address string) string {
+	if len(address) <= 10 {
+		return address
+	}
+	return address[:6] + ".." + address[len(address)-4:]
+}
+
+func sha256Sum(text string) []byte {
+	sum := sha256.Sum256([]byte(text))
+	return sum[:]
 }
 
 func detectRenamedFiles(oldContent, newContent *ContentJSON) map[string]string {
