@@ -40,6 +40,7 @@ type Manager struct {
 	hashfieldFetched map[string]time.Time
 	optionalHashes   map[uint16]struct{}
 	announcer        *tracker.Announcer
+	store            *siteStore
 }
 
 // pooledClient 保存一个 peer 连接以及当前并发占用数。
@@ -56,6 +57,7 @@ type FileMetadata struct {
 
 // NewManager 创建站点管理器。
 func NewManager(dataDir string, peers []string, announcer *tracker.Announcer) *Manager {
+	store, _ := loadSiteStore(dataDir)
 	manager := &Manager{
 		dataDir:          dataDir,
 		peerSet:          make(map[string]struct{}),
@@ -67,6 +69,7 @@ func NewManager(dataDir string, peers []string, announcer *tracker.Announcer) *M
 		hashfieldFetched: make(map[string]time.Time),
 		optionalHashes:   make(map[uint16]struct{}),
 		announcer:        announcer,
+		store:            store,
 	}
 	for _, peer := range peers {
 		manager.addPeer(peer)
@@ -183,18 +186,21 @@ func (m *Manager) NeedFile(siteAddress, innerPath string) error {
 
 // SiteInfo 返回 ZeroFrame 常用的站点元信息。
 func (m *Manager) SiteInfo(siteAddress, fileStatus string) map[string]any {
+	owned := m.IsOwned(siteAddress)
 	info := map[string]any{
 		"address":       siteAddress,
 		"address_short": shortAddress(siteAddress),
 		"address_hash":  hex.EncodeToString(sha256Sum(siteAddress)),
 		"peers":         len(m.peers()),
 		"settings": map[string]any{
-			"own":                         false,
+			"own":                         owned,
 			"permissions":                 []string{},
 			"serving":                     true,
 			"modified_files_notification": true,
 		},
-		"bad_files": 0,
+		"bad_files":    0,
+		"privatekey":   owned,
+		"auth_address": siteAddress,
 	}
 
 	content, err := m.EnsureRootContent(siteAddress)

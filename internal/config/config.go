@@ -71,17 +71,25 @@ func Parse() (*Config, error) {
 		return nil, fmt.Errorf("至少需要一个 --peer 或 --trackers")
 	}
 
-	absDataDir, err := filepath.Abs(cfg.DataDir)
+	absDataDir, err := PrepareDataDir(cfg.DataDir)
 	if err != nil {
-		return nil, fmt.Errorf("解析 data 目录失败: %w", err)
+		return nil, err
 	}
 	cfg.DataDir = absDataDir
 
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建 data 目录失败: %w", err)
-	}
-
 	return cfg, nil
+}
+
+// PrepareDataDir 解析并创建 data 目录。
+func PrepareDataDir(dataDir string) (string, error) {
+	absDataDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return "", fmt.Errorf("解析 data 目录失败: %w", err)
+	}
+	if err := os.MkdirAll(absDataDir, 0o755); err != nil {
+		return "", fmt.Errorf("创建 data 目录失败: %w", err)
+	}
+	return absDataDir, nil
 }
 
 func fetchRemoteTrackers() []string {

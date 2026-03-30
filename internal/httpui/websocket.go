@@ -1,6 +1,7 @@
 package httpui
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
@@ -53,7 +54,7 @@ func (s *Server) handleWSCommand(sess *session, message wsMessage) any {
 	case "serverInfo":
 		return map[string]any{
 			"version": version,
-			"rev":     1,
+			"rev":     4096,
 			"plugins": []string{},
 			"debug":   false,
 			"offline": false,
@@ -85,6 +86,20 @@ func (s *Server) handleWSCommand(sess *session, message wsMessage) any {
 			return map[string]any{"error": err.Error()}
 		}
 		return "ok"
+	case "fileWrite":
+		innerPath := cleanInnerPath(stringParam(message.Params, 0, "inner_path"))
+		contentBase64 := stringParam(message.Params, 1, "content_base64")
+		if innerPath == "" || contentBase64 == "" {
+			return map[string]any{"error": "missing fileWrite params"}
+		}
+		raw, err := base64.StdEncoding.DecodeString(contentBase64)
+		if err != nil {
+			return map[string]any{"error": fmt.Sprintf("invalid base64: %v", err)}
+		}
+		if err := s.manager.WriteSiteData(sess.SiteAddress, innerPath, raw); err != nil {
+			return map[string]any{"error": err.Error()}
+		}
+		return "ok"
 	case "fileRules":
 		innerPath := stringParam(message.Params, 0, "inner_path")
 		return s.manager.FileRules(sess.SiteAddress, cleanInnerPath(innerPath))
@@ -109,6 +124,51 @@ func (s *Server) handleWSCommand(sess *session, message wsMessage) any {
 			return []map[string]any{}
 		}
 		return rows
+	case "siteSign":
+		privateKey := stringParam(message.Params, 0, "privatekey")
+		innerPath := cleanInnerPath(stringParam(message.Params, 1, "inner_path"))
+		if innerPath == "index.html" {
+			innerPath = "content.json"
+		}
+		if privateKey == "stored" || privateKey == "" {
+			privateKey = ""
+		}
+		if err := s.manager.SignContent(sess.SiteAddress, innerPath, privateKey, nil, true); err != nil {
+			return map[string]any{"error": err.Error()}
+		}
+		return "ok"
+	case "sitePublish":
+		privateKey := stringParam(message.Params, 0, "privatekey")
+		innerPath := cleanInnerPath(stringParam(message.Params, 1, "inner_path"))
+		sign := true
+		if params, ok := message.Params.(map[string]any); ok {
+			if innerValue, ok := params["inner_path"].(string); ok && innerValue != "" {
+				innerPath = cleanInnerPath(innerValue)
+			}
+			if flag, ok := params["sign"].(bool); ok {
+				sign = flag
+			}
+		}
+		if innerPath == "" {
+			innerPath = "content.json"
+		}
+		if privateKey == "stored" || privateKey == "" {
+			privateKey = ""
+		}
+		if privateKey != "" {
+			if err := s.manager.SignContent(sess.SiteAddress, innerPath, privateKey, nil, true); err != nil {
+				return map[string]any{"error": err.Error()}
+			}
+			sign = false
+		}
+		published, err := s.manager.PublishSite(sess.SiteAddress, innerPath, sign)
+		if err != nil {
+			return map[string]any{"error": err.Error()}
+		}
+		if published == 0 {
+			return map[string]any{"error": "content publish failed"}
+		}
+		return "ok"
 	case "fileList", "dirList", "certSelect", "certSet", "certAdd", "certList":
 		return map[string]any{"error": fmt.Sprintf("%s not supported yet", message.Cmd)}
 	default:
