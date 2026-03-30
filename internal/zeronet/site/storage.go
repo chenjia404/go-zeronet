@@ -37,6 +37,13 @@ func (m *Manager) BootstrapPeers() []string {
 	return append([]string(nil), m.peers...)
 }
 
+// SetClient 将已经验证可用的连接放入缓存，避免后续重复拨号。
+func (m *Manager) SetClient(peer string, client *conn.Client) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clients[peer] = client
+}
+
 // EnsureRootContent 确保根 content.json 已落盘并被索引。
 func (m *Manager) EnsureRootContent(siteAddress string) (*ContentJSON, error) {
 	return m.ensureContent(siteAddress, "content.json")
@@ -155,27 +162,42 @@ func (m *Manager) lookupFile(siteAddress, innerPath string) (*ContentFile, error
 }
 
 func (m *Manager) downloadFile(siteAddress, innerPath string) error {
-	raw, err := m.fetchFromPeers(siteAddress, innerPath)
-	if err != nil {
-		return err
-	}
 	fileInfo, err := m.lookupFile(siteAddress, innerPath)
 	if err != nil {
 		return err
 	}
-	if err := verifyFile(fileInfo, raw); err != nil {
-		return err
+
+	var lastErr error
+	for _, peer := range m.peers {
+		raw, fetchErr := m.fetchFromPeer(peer, siteAddress, innerPath)
+		if fetchErr != nil {
+			lastErr = fetchErr
+			continue
+		}
+		if verifyErr := verifyFile(innerPath, fileInfo, raw); verifyErr != nil {
+			lastErr = verifyErr
+			m.dropClient(peer)
+			continue
+		}
+		return m.writeSiteFile(siteAddress, innerPath, raw)
 	}
-	return m.writeSiteFile(siteAddress, innerPath, raw)
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可用 peer")
+	}
+	return lastErr
 }
 
-func verifyFile(fileInfo *ContentFile, raw []byte) error {
+func verifyFile(innerPath string, fileInfo *ContentFile, raw []byte) error {
 	if int64(len(raw)) != fileInfo.Size {
-		return fmt.Errorf("文件大小不匹配: got=%d want=%d", len(raw), fileInfo.Size)
+		return fmt.Errorf("%s 文件大小不匹配: got=%d want=%d", innerPath, len(raw), fileInfo.Size)
 	}
 	sum := sha512.Sum512(raw)
-	if hex.EncodeToString(sum[:]) != strings.ToLower(fileInfo.SHA512) {
-		return fmt.Errorf("文件 sha512 校验失败")
+	// Python ZeroNet 的 sha512sum 只保留前 256 bit。
+	gotHash := hex.EncodeToString(sum[:32])
+	wantHash := strings.ToLower(fileInfo.SHA512)
+	if gotHash != wantHash {
+		return fmt.Errorf("%s 文件 sha512 校验失败: got=%s want=%s", innerPath, gotHash, wantHash)
 	}
 	return nil
 }
@@ -201,6 +223,19 @@ func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) 
 	return nil, fmt.Errorf("从 peers 获取 %s 失败: %w", innerPath, lastErr)
 }
 
+func (m *Manager) fetchFromPeer(peer, siteAddress, innerPath string) ([]byte, error) {
+	client, err := m.clientForPeer(peer)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := client.GetFile(siteAddress, innerPath)
+	if err != nil {
+		m.dropClient(peer)
+		return nil, err
+	}
+	return raw, nil
+}
+
 func (m *Manager) clientForPeer(peer string) (*conn.Client, error) {
 	m.mu.Lock()
 	if client, ok := m.clients[peer]; ok {
@@ -222,6 +257,16 @@ func (m *Manager) clientForPeer(peer string) (*conn.Client, error) {
 	}
 	m.clients[peer] = client
 	return client, nil
+}
+
+func (m *Manager) dropClient(peer string) {
+	m.mu.Lock()
+	client := m.clients[peer]
+	delete(m.clients, peer)
+	m.mu.Unlock()
+	if client != nil {
+		_ = client.Close()
+	}
 }
 
 func (m *Manager) siteFilePath(siteAddress, innerPath string) string {
