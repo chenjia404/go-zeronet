@@ -33,6 +33,12 @@ type FileResponse struct {
 	Location int64
 }
 
+// PeerAddress 表示从 PEX 获取到的 peer 地址。
+type PeerAddress struct {
+	IP   string
+	Port int
+}
+
 // Dial 建立 TCP 连接并完成 ZeroNet v2 握手。
 func Dial(addr string) (*Client, error) {
 	netConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
@@ -170,6 +176,51 @@ func (c *Client) GetFile(siteAddress, innerPath string) ([]byte, error) {
 	return out, nil
 }
 
+// Pex 向 peer 请求更多站点 peer。
+func (c *Client) Pex(siteAddress string, knownPeers []PeerAddress, needNum int) ([]PeerAddress, error) {
+	request := protocol.Message{
+		"site": siteAddress,
+		"need": needNum,
+	}
+
+	if len(knownPeers) > 0 {
+		var packedIPv4 [][]byte
+		var packedIPv6 [][]byte
+		for _, peer := range knownPeers {
+			packed, err := protocol.PackAddress(peer.IP, peer.Port)
+			if err != nil {
+				continue
+			}
+			switch len(packed) {
+			case 6:
+				packedIPv4 = append(packedIPv4, packed)
+			case 18:
+				packedIPv6 = append(packedIPv6, packed)
+			}
+		}
+		if len(packedIPv4) > 0 {
+			request["peers"] = packedIPv4
+		}
+		if len(packedIPv6) > 0 {
+			request["peers_ipv6"] = packedIPv6
+		}
+	}
+
+	msg, err := c.request("pex", request)
+	if err != nil {
+		return nil, err
+	}
+	if errText, ok := msg["error"].(string); ok && errText != "" {
+		return nil, fmt.Errorf("peer 返回 pex 错误: %s", errText)
+	}
+
+	var peers []PeerAddress
+	peers = append(peers, decodePackedPeers(msg["peers"])...)
+	peers = append(peers, decodePackedPeers(msg["peers_ipv6"])...)
+	peers = append(peers, decodePackedOnionPeers(msg["peers_onion"])...)
+	return peers, nil
+}
+
 func (c *Client) request(cmd string, params protocol.Message) (protocol.Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -247,4 +298,46 @@ func toInt64(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+func decodePackedPeers(raw any) []PeerAddress {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+
+	var peers []PeerAddress
+	for _, item := range items {
+		packed, ok := item.([]byte)
+		if !ok {
+			continue
+		}
+		ip, port, err := protocol.UnpackAddress(packed)
+		if err != nil || port == 0 {
+			continue
+		}
+		peers = append(peers, PeerAddress{IP: ip, Port: port})
+	}
+	return peers
+}
+
+func decodePackedOnionPeers(raw any) []PeerAddress {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+
+	var peers []PeerAddress
+	for _, item := range items {
+		packed, ok := item.([]byte)
+		if !ok {
+			continue
+		}
+		ip, port, err := protocol.UnpackOnionAddress(packed)
+		if err != nil || port == 0 {
+			continue
+		}
+		peers = append(peers, PeerAddress{IP: ip, Port: port})
+	}
+	return peers
 }

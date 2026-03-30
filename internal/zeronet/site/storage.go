@@ -4,9 +4,11 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -15,32 +17,43 @@ import (
 
 // Manager 管理本地站点目录和回源下载逻辑。
 type Manager struct {
-	dataDir  string
-	peers    []string
-	mu       sync.Mutex
-	clients  map[string]*conn.Client
-	contents map[string]map[string]*ContentJSON
+	dataDir   string
+	peerOrder []string
+	peerSet   map[string]struct{}
+	mu        sync.Mutex
+	clients   map[string]*conn.Client
+	contents  map[string]map[string]*ContentJSON
 }
 
 // NewManager 创建站点管理器。
 func NewManager(dataDir string, peers []string) *Manager {
-	return &Manager{
+	manager := &Manager{
 		dataDir:  dataDir,
-		peers:    append([]string(nil), peers...),
+		peerSet:  make(map[string]struct{}),
 		clients:  make(map[string]*conn.Client),
 		contents: make(map[string]map[string]*ContentJSON),
 	}
+	for _, peer := range peers {
+		manager.addPeer(peer)
+	}
+	return manager
 }
 
 // BootstrapPeers 返回当前配置的 bootstrap peer 列表。
 func (m *Manager) BootstrapPeers() []string {
-	return append([]string(nil), m.peers...)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.peerOrder...)
 }
 
 // SetClient 将已经验证可用的连接放入缓存，避免后续重复拨号。
 func (m *Manager) SetClient(peer string, client *conn.Client) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.peerSet[peer]; !ok {
+		m.peerSet[peer] = struct{}{}
+		m.peerOrder = append(m.peerOrder, peer)
+	}
 	m.clients[peer] = client
 }
 
@@ -168,7 +181,7 @@ func (m *Manager) downloadFile(siteAddress, innerPath string) error {
 	}
 
 	var lastErr error
-	for _, peer := range m.peers {
+	for _, peer := range m.peers() {
 		raw, fetchErr := m.fetchFromPeer(peer, siteAddress, innerPath)
 		if fetchErr != nil {
 			lastErr = fetchErr
@@ -204,7 +217,7 @@ func verifyFile(innerPath string, fileInfo *ContentFile, raw []byte) error {
 
 func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) {
 	var lastErr error
-	for _, peer := range m.peers {
+	for _, peer := range m.peers() {
 		client, err := m.clientForPeer(peer)
 		if err != nil {
 			lastErr = err
@@ -228,6 +241,10 @@ func (m *Manager) fetchFromPeer(peer, siteAddress, innerPath string) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
+
+	// 下载成功后立即做一次 PEX，滚动扩展 peer 池。
+	m.expandPeers(siteAddress, peer, client)
+
 	raw, err := client.GetFile(siteAddress, innerPath)
 	if err != nil {
 		m.dropClient(peer)
@@ -267,6 +284,61 @@ func (m *Manager) dropClient(peer string) {
 	if client != nil {
 		_ = client.Close()
 	}
+}
+
+func (m *Manager) peers() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.peerOrder...)
+}
+
+func (m *Manager) addPeer(peer string) {
+	if peer == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.peerSet[peer]; ok {
+		return
+	}
+	m.peerSet[peer] = struct{}{}
+	m.peerOrder = append(m.peerOrder, peer)
+}
+
+func (m *Manager) expandPeers(siteAddress, currentPeer string, client *conn.Client) {
+	knownPeers := m.knownPeerAddresses(currentPeer)
+	discoveredPeers, err := client.Pex(siteAddress, knownPeers, 10)
+	if err != nil {
+		return
+	}
+	for _, peer := range discoveredPeers {
+		if strings.HasSuffix(peer.IP, ".onion") {
+			continue
+		}
+		m.addPeer(fmt.Sprintf("%s:%d", peer.IP, peer.Port))
+	}
+}
+
+func (m *Manager) knownPeerAddresses(exclude string) []conn.PeerAddress {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	known := make([]conn.PeerAddress, 0, len(m.peerOrder))
+	for _, peer := range m.peerOrder {
+		if peer == exclude {
+			continue
+		}
+		host, port, err := net.SplitHostPort(peer)
+		if err != nil {
+			continue
+		}
+		portNum, err := strconv.Atoi(port)
+		if err != nil {
+			continue
+		}
+		known = append(known, conn.PeerAddress{IP: host, Port: portNum})
+	}
+	return known
 }
 
 func (m *Manager) siteFilePath(siteAddress, innerPath string) string {
