@@ -16,6 +16,8 @@ Go 版 ZeroNet 重写项目。
 - ZeroNet `v2` 握手客户端
 - `ping`
 - `getFile` 分块下载
+- `pex` 和最小多 peer
+- `listModified` 与嵌套 `content.json` 刷新
 - 本地站点目录与 `content.json` 索引
 - 缺文件时自动回源下载的 HTTP 静态服务
 

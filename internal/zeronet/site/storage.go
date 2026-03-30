@@ -304,6 +304,11 @@ func (m *Manager) refreshModifiedContents(siteAddress string, modifiedFiles conn
 }
 
 func (m *Manager) refreshContent(siteAddress, innerPath string) error {
+	oldContent := m.getCachedContent(siteAddress, innerPath)
+	if oldContent == nil {
+		oldContent = m.readCachedContentFromDisk(siteAddress, innerPath)
+	}
+
 	raw, err := m.fetchFromPeers(siteAddress, innerPath)
 	if err != nil {
 		return err
@@ -316,6 +321,11 @@ func (m *Manager) refreshContent(siteAddress, innerPath string) error {
 		return err
 	}
 	m.setCachedContent(siteAddress, innerPath, content)
+	if oldContent != nil {
+		if err := m.removeStaleContentFiles(siteAddress, innerPath, oldContent, content); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -325,16 +335,60 @@ func (m *Manager) contentModified(siteAddress, innerPath string) int64 {
 		return content.Modified
 	}
 
+	content = m.readCachedContentFromDisk(siteAddress, innerPath)
+	if content == nil {
+		return 0
+	}
+	return content.Modified
+}
+
+func (m *Manager) readCachedContentFromDisk(siteAddress, innerPath string) *ContentJSON {
 	raw, err := os.ReadFile(m.siteFilePath(siteAddress, innerPath))
 	if err != nil {
-		return 0
+		return nil
 	}
-	content, err = ParseContentJSON(siteAddress, innerPath, raw)
+	content, err := ParseContentJSON(siteAddress, innerPath, raw)
 	if err != nil {
-		return 0
+		return nil
 	}
 	m.setCachedContent(siteAddress, innerPath, content)
-	return content.Modified
+	return content
+}
+
+func (m *Manager) removeStaleContentFiles(siteAddress, contentPath string, oldContent, newContent *ContentJSON) error {
+	// content.json 更新后，需要移除本地已不再声明的文件，避免继续读取旧资源。
+	removedFiles := make([]string, 0)
+	seen := make(map[string]struct{})
+	for relativePath := range oldContent.Files {
+		if _, ok := newContent.Files[relativePath]; ok {
+			continue
+		}
+		if _, ok := newContent.FilesOptional[relativePath]; ok {
+			continue
+		}
+		removedFiles = append(removedFiles, relativePath)
+		seen[relativePath] = struct{}{}
+	}
+	for relativePath := range oldContent.FilesOptional {
+		if _, ok := seen[relativePath]; ok {
+			continue
+		}
+		if _, ok := newContent.Files[relativePath]; ok {
+			continue
+		}
+		if _, ok := newContent.FilesOptional[relativePath]; ok {
+			continue
+		}
+		removedFiles = append(removedFiles, relativePath)
+	}
+
+	for _, relativePath := range removedFiles {
+		fullPath := m.siteFilePath(siteAddress, resolveContentFilePath(contentPath, relativePath))
+		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("删除失效文件失败 %s: %w", fullPath, err)
+		}
+	}
+	return nil
 }
 
 func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) {
@@ -519,4 +573,20 @@ func nthSlash(s string, n int) int {
 		}
 	}
 	return -1
+}
+
+func resolveContentFilePath(contentPath, relativePath string) string {
+	baseDir := pathDir(contentPath)
+	if baseDir == "" {
+		return relativePath
+	}
+	return baseDir + "/" + relativePath
+}
+
+func pathDir(innerPath string) string {
+	index := strings.LastIndex(innerPath, "/")
+	if index < 0 {
+		return ""
+	}
+	return innerPath[:index]
 }
