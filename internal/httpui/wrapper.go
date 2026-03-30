@@ -40,15 +40,15 @@ var wrapperTemplate = template.Must(template.New("wrapper").Parse(`<!doctype htm
       <div class="title">{{.Title}}</div>
       <div class="badge">{{.SiteAddress}}</div>
     </div>
-    <iframe id="inner-iframe" sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-modals allow-downloads allow-pointer-lock allow-presentation" src="{{.IFrameURL}}"></iframe>
+    <iframe id="inner-iframe" sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-modals allow-downloads allow-pointer-lock allow-presentation" allow="fullscreen; unload" src="{{.IFrameURL}}"></iframe>
   </div>
   <div class="toast-wrap" id="toast-wrap"></div>
   <script>
-    window.wrapper_nonce = {{printf "%q" .WrapperNonce}};
-    window.wrapper_key = {{printf "%q" .WrapperKey}};
-    window.ajax_key = {{printf "%q" .AjaxKey}};
-    window.file_inner_path = {{printf "%q" .InnerPath}};
-    window.address = {{printf "%q" .SiteAddress}};
+    window.wrapper_nonce = "{{.WrapperNonce}}";
+    window.wrapper_key = "{{.WrapperKey}}";
+    window.ajax_key = "{{.AjaxKey}}";
+    window.file_inner_path = "{{.InnerPath}}";
+    window.address = "{{.SiteAddress}}";
 
     const iframe = document.getElementById("inner-iframe");
     const callbacks = new Map();

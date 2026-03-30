@@ -3,6 +3,7 @@ package site
 import (
 	"crypto/sha256"
 	"crypto/sha512"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -20,19 +21,31 @@ import (
 	"github.com/chenjia404/go-zeronet/internal/zeronet/conn"
 )
 
+const (
+	peerPoolSize          = 4
+	parallelFetchAttempts = 4
+)
+
 // Manager 管理本地站点目录和回源下载逻辑。
 type Manager struct {
 	dataDir          string
 	peerOrder        []string
 	peerSet          map[string]struct{}
 	mu               sync.Mutex
-	clients          map[string]*conn.Client
+	clients          map[string][]*pooledClient
+	dbs              map[string]*sql.DB
 	contents         map[string]map[string]*ContentJSON
 	lastCheck        map[string]time.Time
 	peerHashfields   map[string]conn.Hashfield
 	hashfieldFetched map[string]time.Time
 	optionalHashes   map[uint16]struct{}
 	announcer        *tracker.Announcer
+}
+
+// pooledClient 保存一个 peer 连接以及当前并发占用数。
+type pooledClient struct {
+	client   *conn.Client
+	inFlight int
 }
 
 // FileMetadata 表示某个文件条目以及它是否来自 optional 文件集合。
@@ -46,7 +59,8 @@ func NewManager(dataDir string, peers []string, announcer *tracker.Announcer) *M
 	manager := &Manager{
 		dataDir:          dataDir,
 		peerSet:          make(map[string]struct{}),
-		clients:          make(map[string]*conn.Client),
+		clients:          make(map[string][]*pooledClient),
+		dbs:              make(map[string]*sql.DB),
 		contents:         make(map[string]map[string]*ContentJSON),
 		lastCheck:        make(map[string]time.Time),
 		peerHashfields:   make(map[string]conn.Hashfield),
@@ -75,7 +89,7 @@ func (m *Manager) SetClient(peer string, client *conn.Client) {
 		m.peerSet[peer] = struct{}{}
 		m.peerOrder = append(m.peerOrder, peer)
 	}
-	m.clients[peer] = client
+	m.clients[peer] = append(m.clients[peer], &pooledClient{client: client})
 }
 
 // EnsureRootContent 确保根 content.json 已落盘并被索引。
@@ -143,9 +157,13 @@ func (m *Manager) NewFileHandler() http.Handler {
 
 // ReadSiteFile 读取站点文件，必要时自动下载。
 func (m *Manager) ReadSiteFile(siteAddress, innerPath, format string) (any, error) {
-	filePath, err := m.OpenSiteFile(siteAddress, innerPath)
-	if err != nil {
-		return nil, err
+	filePath := m.siteFilePath(siteAddress, innerPath)
+	if _, err := os.Stat(filePath); err != nil {
+		var openErr error
+		filePath, openErr = m.OpenSiteFile(siteAddress, innerPath)
+		if openErr != nil {
+			return nil, openErr
+		}
 	}
 	raw, err := os.ReadFile(filePath)
 	if err != nil {
@@ -171,9 +189,10 @@ func (m *Manager) SiteInfo(siteAddress, fileStatus string) map[string]any {
 		"address_hash":  hex.EncodeToString(sha256Sum(siteAddress)),
 		"peers":         len(m.peers()),
 		"settings": map[string]any{
-			"own":         false,
-			"permissions": []string{},
-			"serving":     true,
+			"own":                         false,
+			"permissions":                 []string{},
+			"serving":                     true,
+			"modified_files_notification": true,
 		},
 		"bad_files": 0,
 	}
@@ -214,6 +233,11 @@ func (m *Manager) FileRules(siteAddress, innerPath string) map[string]any {
 		"includes_allowed": false,
 		"optional":         fileInfo.Optional,
 	}
+}
+
+// DBQuery 执行 ZeroNet 风格的只读 dbQuery。
+func (m *Manager) DBQuery(siteAddress, query string) ([]map[string]any, error) {
+	return m.queryDB(siteAddress, query)
 }
 
 func (m *Manager) ensureContent(siteAddress, innerPath string) (*ContentJSON, error) {
@@ -261,11 +285,12 @@ func (m *Manager) refreshSite(siteAddress string) error {
 
 	var latestModifiedFiles conn.ModifiedFilesResponse
 	for _, peer := range m.peers() {
-		client, err := m.clientForPeer(peer)
+		client, release, err := m.clientForPeer(peer)
 		if err != nil {
 			continue
 		}
 		modifiedFiles, err := client.ListModified(siteAddress, 0)
+		release()
 		if err != nil {
 			m.dropClient(peer)
 			continue
@@ -520,6 +545,7 @@ func (m *Manager) renameContentFiles(siteAddress, contentPath string, oldContent
 			continue
 		}
 	}
+	m.invalidateDB(siteAddress)
 }
 
 func (m *Manager) removeArchivedUserContents(siteAddress, contentPath string, oldContent, newContent *ContentJSON) error {
@@ -607,45 +633,29 @@ func (m *Manager) preloadRelatedContents(siteAddress, contentPath string, conten
 }
 
 func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) {
-	var lastErr error
-	for _, peer := range m.peers() {
-		client, err := m.clientForPeer(peer)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		raw, err := client.GetFile(siteAddress, innerPath)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+	raw, err := m.parallelFetch(siteAddress, innerPath, m.peers())
+	if err == nil {
 		return raw, nil
 	}
+	lastErr := err
 	if lastErr == nil {
 		lastErr = fmt.Errorf("没有可用 peer")
 	}
 	m.announceSite(siteAddress)
-	for _, peer := range m.peers() {
-		client, err := m.clientForPeer(peer)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		raw, err := client.GetFile(siteAddress, innerPath)
-		if err != nil {
-			lastErr = err
-			continue
-		}
+	raw, err = m.parallelFetch(siteAddress, innerPath, m.peers())
+	if err == nil {
 		return raw, nil
 	}
+	lastErr = err
 	return nil, fmt.Errorf("从 peers 获取 %s 失败: %w", innerPath, lastErr)
 }
 
 func (m *Manager) fetchFromPeer(peer, siteAddress, innerPath string) ([]byte, error) {
-	client, err := m.clientForPeer(peer)
+	client, release, err := m.clientForPeer(peer)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 
 	// 下载成功后立即做一次 PEX，滚动扩展 peer 池。
 	m.expandPeers(siteAddress, peer, client)
@@ -686,11 +696,12 @@ func (m *Manager) downloadPeers(siteAddress string, fileInfo *FileMetadata) []st
 
 func (m *Manager) expandOptionalPeers(siteAddress string, hashID uint16) {
 	for _, peer := range m.peers() {
-		client, err := m.clientForPeer(peer)
+		client, release, err := m.clientForPeer(peer)
 		if err != nil {
 			continue
 		}
 		hashPeers, err := client.FindHashIDs(siteAddress, []uint16{hashID})
+		release()
 		if err != nil {
 			continue
 		}
@@ -710,10 +721,11 @@ func (m *Manager) peerHasOptionalFile(siteAddress, peer string, hashID uint16) (
 		return hasFile, true
 	}
 
-	client, err := m.clientForPeer(peer)
+	client, release, err := m.clientForPeer(peer)
 	if err != nil {
 		return false, false
 	}
+	defer release()
 	hashfield, err = client.GetHashfield(siteAddress)
 	if err != nil {
 		m.dropClient(peer)
@@ -724,39 +736,125 @@ func (m *Manager) peerHasOptionalFile(siteAddress, peer string, hashID uint16) (
 	return hasFile, true
 }
 
-func (m *Manager) clientForPeer(peer string) (*conn.Client, error) {
+func (m *Manager) clientForPeer(peer string) (*conn.Client, func(), error) {
 	m.mu.Lock()
-	if client, ok := m.clients[peer]; ok {
+	if pooled := m.pickPooledClient(peer); pooled != nil {
+		pooled.inFlight++
 		m.mu.Unlock()
-		return client, nil
+		return pooled.client, m.releasePeerClient(peer, pooled.client), nil
 	}
 	m.mu.Unlock()
 
 	client, err := conn.Dial(peer)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing, ok := m.clients[peer]; ok {
+	if pooled := m.pickPooledClient(peer); pooled != nil {
+		m.mu.Unlock()
 		_ = client.Close()
-		return existing, nil
+		pooled.inFlight++
+		return pooled.client, m.releasePeerClient(peer, pooled.client), nil
 	}
-	m.clients[peer] = client
+	entry := &pooledClient{client: client, inFlight: 1}
+	m.clients[peer] = append(m.clients[peer], entry)
+	m.mu.Unlock()
 	m.discoverSharedTrackers()
-	return client, nil
+	return client, m.releasePeerClient(peer, client), nil
+}
+
+func (m *Manager) pickPooledClient(peer string) *pooledClient {
+	entries := m.clients[peer]
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var best *pooledClient
+	for _, entry := range entries {
+		if entry == nil || entry.client == nil {
+			continue
+		}
+		if best == nil || entry.inFlight < best.inFlight {
+			best = entry
+		}
+	}
+	if best != nil && best.inFlight == 0 {
+		return best
+	}
+	if len(entries) < peerPoolSize {
+		return nil
+	}
+	return best
+}
+
+func (m *Manager) releasePeerClient(peer string, client *conn.Client) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			for _, entry := range m.clients[peer] {
+				if entry == nil || entry.client != client {
+					continue
+				}
+				if entry.inFlight > 0 {
+					entry.inFlight--
+				}
+				return
+			}
+		})
+	}
+}
+
+func (m *Manager) parallelFetch(siteAddress, innerPath string, peers []string) ([]byte, error) {
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("没有可用 peer")
+	}
+
+	limit := parallelFetchAttempts
+	if len(peers) < limit {
+		limit = len(peers)
+	}
+
+	type result struct {
+		raw []byte
+		err error
+	}
+	results := make(chan result, limit)
+
+	for _, peer := range peers[:limit] {
+		go func(currentPeer string) {
+			raw, err := m.fetchFromPeer(currentPeer, siteAddress, innerPath)
+			results <- result{raw: raw, err: err}
+		}(peer)
+	}
+
+	var lastErr error
+	for i := 0; i < limit; i++ {
+		item := <-results
+		if item.err == nil {
+			return item.raw, nil
+		}
+		lastErr = item.err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("没有可用 peer")
+	}
+	return nil, lastErr
 }
 
 func (m *Manager) dropClient(peer string) {
 	m.mu.Lock()
-	client := m.clients[peer]
+	entries := m.clients[peer]
 	delete(m.clients, peer)
 	delete(m.peerHashfields, peer)
 	delete(m.hashfieldFetched, peer)
 	m.mu.Unlock()
-	if client != nil {
-		_ = client.Close()
+	for _, entry := range entries {
+		if entry != nil && entry.client != nil {
+			_ = entry.client.Close()
+		}
 	}
 }
 
@@ -900,6 +998,7 @@ func (m *Manager) writeSiteFile(siteAddress, innerPath string, raw []byte) error
 	if err := os.WriteFile(fullPath, raw, 0o644); err != nil {
 		return fmt.Errorf("写入站点文件失败: %w", err)
 	}
+	m.invalidateDB(siteAddress)
 	return nil
 }
 
@@ -1054,6 +1153,7 @@ func (m *Manager) removeContentTree(siteAddress, contentPath string) error {
 	if err := os.RemoveAll(dirPath); err != nil {
 		return fmt.Errorf("删除归档目录失败 %s: %w", dirPath, err)
 	}
+	m.invalidateDB(siteAddress)
 
 	for _, content := range removedContents {
 		for relativePath := range content.FilesOptional {
@@ -1074,6 +1174,18 @@ func (m *Manager) removeContentTree(siteAddress, contentPath string) error {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) invalidateDB(siteAddress string) {
+	m.mu.Lock()
+	db := m.dbs[siteAddress]
+	delete(m.dbs, siteAddress)
+	m.mu.Unlock()
+	if db != nil {
+		_ = db.Close()
+	}
+	// Python ZeroNet 也会在站点目录下维护本地 SQLite 索引，这里同步删除旧库。
+	_ = os.Remove(m.siteFilePath(siteAddress, "data/zeroblog.db"))
 }
 
 func (m *Manager) collectContentTree(siteAddress, contentPath string) []*ContentJSON {

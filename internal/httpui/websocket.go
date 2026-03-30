@@ -90,9 +90,26 @@ func (s *Server) handleWSCommand(sess *session, message wsMessage) any {
 		return s.manager.FileRules(sess.SiteAddress, cleanInnerPath(innerPath))
 	case "siteBadFiles":
 		return []string{}
+	case "siteListModifiedFiles":
+		return map[string]any{"modified_files": []string{}}
+	case "feedListFollow":
+		return []map[string]any{}
+	case "innerLoaded":
+		return "ok"
 	case "channelJoin":
 		return "ok"
-	case "fileList", "dirList", "dbQuery", "certSelect", "certSet", "certAdd", "certList":
+	case "dbQuery":
+		query := queryParam(message.Params)
+		if query == "" {
+			return []map[string]any{}
+		}
+		rows, err := s.manager.DBQuery(sess.SiteAddress, query)
+		if err != nil {
+			// 很多老站点默认把 dbQuery 结果当数组处理，这里保持数组形状避免前端直接崩溃。
+			return []map[string]any{}
+		}
+		return rows
+	case "fileList", "dirList", "certSelect", "certSet", "certAdd", "certList":
 		return map[string]any{"error": fmt.Sprintf("%s not supported yet", message.Cmd)}
 	default:
 		return map[string]any{"error": "Unknown command: " + message.Cmd}
@@ -129,4 +146,22 @@ func cleanInnerPath(innerPath string) string {
 		return "index.html"
 	}
 	return innerPath
+}
+
+func queryParam(raw any) string {
+	switch val := raw.(type) {
+	case string:
+		return val
+	case []any:
+		if len(val) == 0 {
+			return ""
+		}
+		switch query := val[0].(type) {
+		case string:
+			return query
+		case []byte:
+			return string(query)
+		}
+	}
+	return stringParam(raw, 0, "query")
 }

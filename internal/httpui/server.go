@@ -76,6 +76,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter) {
+	setCommonHeaders(w)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = w.Write([]byte("go-zeronet is running\n\nOpen /<site-address> to fetch a site.\n"))
 }
@@ -111,6 +112,7 @@ func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	setCommonHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(renderWrapper(wrapperData{
 		Title:        title,
@@ -144,6 +146,7 @@ func (s *Server) serveSiteFile(w http.ResponseWriter, r *http.Request, siteAddre
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	setCommonHeaders(w)
 	http.ServeFile(w, r, filePath)
 }
 
@@ -203,4 +206,9 @@ func cloneQuery(values url.Values) url.Values {
 		back[key] = append([]string(nil), items...)
 	}
 	return back
+}
+
+func setCommonHeaders(w http.ResponseWriter) {
+	// Chrome 2026 年开始逐步默认禁用 unload，这里显式为老 ZeroNet 站点保留兼容。
+	w.Header().Set("Permissions-Policy", "unload=*")
 }
