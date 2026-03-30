@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -45,6 +46,9 @@ type ModifiedFilesResponse map[string]int64
 
 // Hashfield 保存 peer 宣告拥有的 optional 文件 hash id。
 type Hashfield map[uint16]struct{}
+
+// HashIDPeers 保存每个 hash id 对应的一组 peer 地址。
+type HashIDPeers map[uint16][]PeerAddress
 
 // Dial 建立 TCP 连接并完成 ZeroNet v2 握手。
 func Dial(addr string) (*Client, error) {
@@ -267,6 +271,35 @@ func (c *Client) GetHashfield(siteAddress string) (Hashfield, error) {
 	return decodeHashfield(raw), nil
 }
 
+// FindHashIDs 向 peer 查询一组 optional hash id 对应的 peer。
+func (c *Client) FindHashIDs(siteAddress string, hashIDs []uint16) (HashIDPeers, error) {
+	if len(hashIDs) == 0 {
+		return HashIDPeers{}, nil
+	}
+
+	values := make([]int64, 0, len(hashIDs))
+	for _, hashID := range hashIDs {
+		values = append(values, int64(hashID))
+	}
+
+	msg, err := c.request("findHashIds", protocol.Message{
+		"site":     siteAddress,
+		"hash_ids": values,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if errText, ok := msg["error"].(string); ok && errText != "" {
+		return nil, fmt.Errorf("peer 返回 findHashIds 错误: %s", errText)
+	}
+
+	back := make(HashIDPeers)
+	mergeHashPeers(back, msg["peers"], false)
+	mergeHashPeers(back, msg["peers_ipv6"], false)
+	mergeHashPeers(back, msg["peers_onion"], true)
+	return back, nil
+}
+
 func (c *Client) request(cmd string, params protocol.Message) (protocol.Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -414,6 +447,61 @@ func decodeHashfield(raw []byte) Hashfield {
 	for i := 0; i+1 < len(raw); i += 2 {
 		hashID := binary.LittleEndian.Uint16(raw[i : i+2])
 		back[hashID] = struct{}{}
+	}
+	return back
+}
+
+func parseUint16(v string) (uint16, error) {
+	value, err := strconv.ParseUint(v, 10, 16)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(value), nil
+}
+
+func mergeHashPeers(target HashIDPeers, raw any, onion bool) {
+	var items map[uint16][]PeerAddress
+	switch val := raw.(type) {
+	case map[any]any:
+		items = decodeHashPeerMap(val, onion)
+	case map[string]any:
+		items = decodeStringHashPeerMap(val, onion)
+	case map[uint16][]PeerAddress:
+		items = val
+	default:
+		return
+	}
+
+	for hashID, peers := range items {
+		target[hashID] = append(target[hashID], peers...)
+	}
+}
+
+func decodeHashPeerMap(raw map[any]any, onion bool) map[uint16][]PeerAddress {
+	back := make(map[uint16][]PeerAddress)
+	for key, value := range raw {
+		hashID := uint16(toInt64(key))
+		if onion {
+			back[hashID] = append(back[hashID], decodePackedOnionPeers(value)...)
+		} else {
+			back[hashID] = append(back[hashID], decodePackedPeers(value)...)
+		}
+	}
+	return back
+}
+
+func decodeStringHashPeerMap(raw map[string]any, onion bool) map[uint16][]PeerAddress {
+	back := make(map[uint16][]PeerAddress)
+	for key, value := range raw {
+		hashID, err := parseUint16(key)
+		if err != nil {
+			continue
+		}
+		if onion {
+			back[hashID] = append(back[hashID], decodePackedOnionPeers(value)...)
+		} else {
+			back[hashID] = append(back[hashID], decodePackedPeers(value)...)
+		}
 	}
 	return back
 }

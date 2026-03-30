@@ -28,6 +28,7 @@ type Manager struct {
 	lastCheck        map[string]time.Time
 	peerHashfields   map[string]conn.Hashfield
 	hashfieldFetched map[string]time.Time
+	optionalHashes   map[uint16]struct{}
 }
 
 // FileMetadata 表示某个文件条目以及它是否来自 optional 文件集合。
@@ -46,6 +47,7 @@ func NewManager(dataDir string, peers []string) *Manager {
 		lastCheck:        make(map[string]time.Time),
 		peerHashfields:   make(map[string]conn.Hashfield),
 		hashfieldFetched: make(map[string]time.Time),
+		optionalHashes:   make(map[uint16]struct{}),
 	}
 	for _, peer := range peers {
 		manager.addPeer(peer)
@@ -248,7 +250,11 @@ func (m *Manager) downloadFile(siteAddress, innerPath string) error {
 			m.dropClient(peer)
 			continue
 		}
-		return m.writeSiteFile(siteAddress, innerPath, raw)
+		if err := m.writeSiteFile(siteAddress, innerPath, raw); err != nil {
+			return err
+		}
+		m.trackDownloadedOptional(fileInfo)
+		return nil
 	}
 
 	if lastErr == nil {
@@ -332,6 +338,7 @@ func (m *Manager) refreshContent(siteAddress, innerPath string) error {
 	if err := m.writeSiteFile(siteAddress, innerPath, raw); err != nil {
 		return err
 	}
+	m.renameContentFiles(siteAddress, innerPath, oldContent, content)
 	m.setCachedContent(siteAddress, innerPath, content)
 	m.preloadRelatedContents(siteAddress, innerPath, content)
 	if oldContent != nil {
@@ -403,8 +410,30 @@ func (m *Manager) removeStaleContentFiles(siteAddress, contentPath string, oldCo
 		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("删除失效文件失败 %s: %w", fullPath, err)
 		}
+		m.trackRemovedOptional(oldContent, newContent, relativePath)
 	}
 	return nil
+}
+
+func (m *Manager) renameContentFiles(siteAddress, contentPath string, oldContent, newContent *ContentJSON) {
+	if oldContent == nil || newContent == nil {
+		return
+	}
+
+	renamed := detectRenamedFiles(oldContent, newContent)
+	for oldRelativePath, newRelativePath := range renamed {
+		oldPath := m.siteFilePath(siteAddress, resolveContentFilePath(contentPath, oldRelativePath))
+		newPath := m.siteFilePath(siteAddress, resolveContentFilePath(contentPath, newRelativePath))
+		if _, err := os.Stat(oldPath); err != nil {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+			continue
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			continue
+		}
+	}
 }
 
 func (m *Manager) removeArchivedUserContents(siteAddress, contentPath string, oldContent, newContent *ContentJSON) error {
@@ -530,15 +559,17 @@ func (m *Manager) fetchFromPeer(peer, siteAddress, innerPath string) ([]byte, er
 }
 
 func (m *Manager) downloadPeers(siteAddress string, fileInfo *FileMetadata) []string {
-	peers := m.peers()
 	if fileInfo == nil || !fileInfo.Optional {
-		return peers
+		return m.peers()
 	}
 
 	hashID, ok := optionalHashID(fileInfo.SHA512)
 	if !ok {
-		return peers
+		return m.peers()
 	}
+
+	m.expandOptionalPeers(siteAddress, hashID)
+	peers := m.peers()
 
 	preferred := make([]string, 0, len(peers))
 	fallback := make([]string, 0, len(peers))
@@ -551,6 +582,25 @@ func (m *Manager) downloadPeers(siteAddress string, fileInfo *FileMetadata) []st
 		fallback = append(fallback, peer)
 	}
 	return append(preferred, fallback...)
+}
+
+func (m *Manager) expandOptionalPeers(siteAddress string, hashID uint16) {
+	for _, peer := range m.peers() {
+		client, err := m.clientForPeer(peer)
+		if err != nil {
+			continue
+		}
+		hashPeers, err := client.FindHashIDs(siteAddress, []uint16{hashID})
+		if err != nil {
+			continue
+		}
+		for _, candidate := range hashPeers[hashID] {
+			if candidate.Port == 0 || strings.HasSuffix(candidate.IP, ".onion") {
+				continue
+			}
+			m.addPeer(fmt.Sprintf("%s:%d", candidate.IP, candidate.Port))
+		}
+	}
 }
 
 func (m *Manager) peerHasOptionalFile(siteAddress, peer string, hashID uint16) (bool, bool) {
@@ -644,6 +694,41 @@ func (m *Manager) setPeerHashfield(peer string, hashfield conn.Hashfield) {
 	defer m.mu.Unlock()
 	m.peerHashfields[peer] = hashfield
 	m.hashfieldFetched[peer] = time.Now()
+}
+
+func (m *Manager) trackDownloadedOptional(fileInfo *FileMetadata) {
+	if fileInfo == nil || !fileInfo.Optional {
+		return
+	}
+	hashID, ok := optionalHashID(fileInfo.SHA512)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.optionalHashes[hashID] = struct{}{}
+}
+
+func (m *Manager) trackRemovedOptional(oldContent, newContent *ContentJSON, relativePath string) {
+	if oldContent == nil {
+		return
+	}
+	fileInfo, ok := oldContent.FilesOptional[relativePath]
+	if !ok {
+		return
+	}
+	for _, current := range newContent.FilesOptional {
+		if strings.EqualFold(current.SHA512, fileInfo.SHA512) {
+			return
+		}
+	}
+	hashID, ok := optionalHashID(fileInfo.SHA512)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.optionalHashes, hashID)
 }
 
 func (m *Manager) expandPeers(siteAddress, currentPeer string, client *conn.Client) {
@@ -843,9 +928,16 @@ func (m *Manager) removeContentTree(siteAddress, contentPath string) error {
 		return nil
 	}
 
+	removedContents := m.collectContentTree(siteAddress, contentPath)
 	dirPath := m.siteFilePath(siteAddress, pathDir(contentPath))
 	if err := os.RemoveAll(dirPath); err != nil {
 		return fmt.Errorf("删除归档目录失败 %s: %w", dirPath, err)
+	}
+
+	for _, content := range removedContents {
+		for relativePath := range content.FilesOptional {
+			m.trackRemovedOptional(content, &ContentJSON{}, relativePath)
+		}
 	}
 
 	m.mu.Lock()
@@ -861,6 +953,25 @@ func (m *Manager) removeContentTree(siteAddress, contentPath string) error {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) collectContentTree(siteAddress, contentPath string) []*ContentJSON {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	siteContents := m.contents[siteAddress]
+	if siteContents == nil {
+		return nil
+	}
+
+	prefix := pathDir(contentPath) + "/"
+	var removed []*ContentJSON
+	for innerPath, content := range siteContents {
+		if innerPath == contentPath || strings.HasPrefix(innerPath, prefix) {
+			removed = append(removed, content)
+		}
+	}
+	return removed
 }
 
 func anyToInt64(v any) int64 {
@@ -903,4 +1014,41 @@ func optionalHashID(sha512hex string) (uint16, bool) {
 		return 0, false
 	}
 	return uint16(value), true
+}
+
+func detectRenamedFiles(oldContent, newContent *ContentJSON) map[string]string {
+	oldFiles := mergeContentFiles(oldContent)
+	newFiles := mergeContentFiles(newContent)
+	deletedByHash := make(map[string]string)
+	for relativePath, fileInfo := range oldFiles {
+		if _, ok := newFiles[relativePath]; ok {
+			continue
+		}
+		deletedByHash[strings.ToLower(fileInfo.SHA512)] = relativePath
+	}
+
+	renamed := make(map[string]string)
+	for relativePath, fileInfo := range newFiles {
+		if _, ok := oldFiles[relativePath]; ok {
+			continue
+		}
+		if oldRelativePath, ok := deletedByHash[strings.ToLower(fileInfo.SHA512)]; ok {
+			renamed[oldRelativePath] = relativePath
+		}
+	}
+	return renamed
+}
+
+func mergeContentFiles(content *ContentJSON) map[string]ContentFile {
+	back := make(map[string]ContentFile)
+	if content == nil {
+		return back
+	}
+	for relativePath, fileInfo := range content.Files {
+		back[relativePath] = fileInfo
+	}
+	for relativePath, fileInfo := range content.FilesOptional {
+		back[relativePath] = fileInfo
+	}
+	return back
 }
