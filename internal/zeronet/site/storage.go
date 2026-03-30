@@ -19,23 +19,33 @@ import (
 
 // Manager 管理本地站点目录和回源下载逻辑。
 type Manager struct {
-	dataDir   string
-	peerOrder []string
-	peerSet   map[string]struct{}
-	mu        sync.Mutex
-	clients   map[string]*conn.Client
-	contents  map[string]map[string]*ContentJSON
-	lastCheck map[string]time.Time
+	dataDir          string
+	peerOrder        []string
+	peerSet          map[string]struct{}
+	mu               sync.Mutex
+	clients          map[string]*conn.Client
+	contents         map[string]map[string]*ContentJSON
+	lastCheck        map[string]time.Time
+	peerHashfields   map[string]conn.Hashfield
+	hashfieldFetched map[string]time.Time
+}
+
+// FileMetadata 表示某个文件条目以及它是否来自 optional 文件集合。
+type FileMetadata struct {
+	ContentFile
+	Optional bool
 }
 
 // NewManager 创建站点管理器。
 func NewManager(dataDir string, peers []string) *Manager {
 	manager := &Manager{
-		dataDir:   dataDir,
-		peerSet:   make(map[string]struct{}),
-		clients:   make(map[string]*conn.Client),
-		contents:  make(map[string]map[string]*ContentJSON),
-		lastCheck: make(map[string]time.Time),
+		dataDir:          dataDir,
+		peerSet:          make(map[string]struct{}),
+		clients:          make(map[string]*conn.Client),
+		contents:         make(map[string]map[string]*ContentJSON),
+		lastCheck:        make(map[string]time.Time),
+		peerHashfields:   make(map[string]conn.Hashfield),
+		hashfieldFetched: make(map[string]time.Time),
 	}
 	for _, peer := range peers {
 		manager.addPeer(peer)
@@ -187,16 +197,16 @@ func (m *Manager) refreshSite(siteAddress string) error {
 	return m.refreshModifiedContents(siteAddress, latestModifiedFiles)
 }
 
-func (m *Manager) lookupFile(siteAddress, innerPath string) (*ContentFile, error) {
+func (m *Manager) lookupFile(siteAddress, innerPath string) (*FileMetadata, error) {
 	content, err := m.EnsureRootContent(siteAddress)
 	if err != nil {
 		return nil, err
 	}
 	if file, ok := content.Files[innerPath]; ok {
-		return &file, nil
+		return &FileMetadata{ContentFile: file}, nil
 	}
 	if file, ok := content.FilesOptional[innerPath]; ok {
-		return &file, nil
+		return &FileMetadata{ContentFile: file, Optional: true}, nil
 	}
 
 	for i := strings.Count(innerPath, "/"); i >= 1; i-- {
@@ -211,10 +221,10 @@ func (m *Manager) lookupFile(siteAddress, innerPath string) (*ContentFile, error
 		}
 		relativePath := strings.TrimPrefix(innerPath[idx+1:], "/")
 		if file, ok := nestedContent.Files[relativePath]; ok {
-			return &file, nil
+			return &FileMetadata{ContentFile: file}, nil
 		}
 		if file, ok := nestedContent.FilesOptional[relativePath]; ok {
-			return &file, nil
+			return &FileMetadata{ContentFile: file, Optional: true}, nil
 		}
 	}
 	return nil, fmt.Errorf("文件未在 content.json 中声明: %s", innerPath)
@@ -227,13 +237,13 @@ func (m *Manager) downloadFile(siteAddress, innerPath string) error {
 	}
 
 	var lastErr error
-	for _, peer := range m.peers() {
+	for _, peer := range m.downloadPeers(siteAddress, fileInfo) {
 		raw, fetchErr := m.fetchFromPeer(peer, siteAddress, innerPath)
 		if fetchErr != nil {
 			lastErr = fetchErr
 			continue
 		}
-		if verifyErr := verifyFile(innerPath, fileInfo, raw); verifyErr != nil {
+		if verifyErr := verifyFile(innerPath, &fileInfo.ContentFile, raw); verifyErr != nil {
 			lastErr = verifyErr
 			m.dropClient(peer)
 			continue
@@ -270,7 +280,7 @@ func (m *Manager) verifyLocalFile(siteAddress, innerPath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := verifyFile(innerPath, fileInfo, raw); err != nil {
+	if err := verifyFile(innerPath, &fileInfo.ContentFile, raw); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -519,6 +529,51 @@ func (m *Manager) fetchFromPeer(peer, siteAddress, innerPath string) ([]byte, er
 	return raw, nil
 }
 
+func (m *Manager) downloadPeers(siteAddress string, fileInfo *FileMetadata) []string {
+	peers := m.peers()
+	if fileInfo == nil || !fileInfo.Optional {
+		return peers
+	}
+
+	hashID, ok := optionalHashID(fileInfo.SHA512)
+	if !ok {
+		return peers
+	}
+
+	preferred := make([]string, 0, len(peers))
+	fallback := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		hasFile, known := m.peerHasOptionalFile(siteAddress, peer, hashID)
+		if known && hasFile {
+			preferred = append(preferred, peer)
+			continue
+		}
+		fallback = append(fallback, peer)
+	}
+	return append(preferred, fallback...)
+}
+
+func (m *Manager) peerHasOptionalFile(siteAddress, peer string, hashID uint16) (bool, bool) {
+	hashfield, ok := m.getPeerHashfield(peer)
+	if ok {
+		_, hasFile := hashfield[hashID]
+		return hasFile, true
+	}
+
+	client, err := m.clientForPeer(peer)
+	if err != nil {
+		return false, false
+	}
+	hashfield, err = client.GetHashfield(siteAddress)
+	if err != nil {
+		m.dropClient(peer)
+		return false, false
+	}
+	m.setPeerHashfield(peer, hashfield)
+	_, hasFile := hashfield[hashID]
+	return hasFile, true
+}
+
 func (m *Manager) clientForPeer(peer string) (*conn.Client, error) {
 	m.mu.Lock()
 	if client, ok := m.clients[peer]; ok {
@@ -546,6 +601,8 @@ func (m *Manager) dropClient(peer string) {
 	m.mu.Lock()
 	client := m.clients[peer]
 	delete(m.clients, peer)
+	delete(m.peerHashfields, peer)
+	delete(m.hashfieldFetched, peer)
 	m.mu.Unlock()
 	if client != nil {
 		_ = client.Close()
@@ -569,6 +626,24 @@ func (m *Manager) addPeer(peer string) {
 	}
 	m.peerSet[peer] = struct{}{}
 	m.peerOrder = append(m.peerOrder, peer)
+}
+
+func (m *Manager) getPeerHashfield(peer string) (conn.Hashfield, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	hashfield := m.peerHashfields[peer]
+	fetchedAt := m.hashfieldFetched[peer]
+	if hashfield == nil || time.Since(fetchedAt) > 5*time.Minute {
+		return nil, false
+	}
+	return hashfield, true
+}
+
+func (m *Manager) setPeerHashfield(peer string, hashfield conn.Hashfield) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerHashfields[peer] = hashfield
+	m.hashfieldFetched[peer] = time.Now()
 }
 
 func (m *Manager) expandPeers(siteAddress, currentPeer string, client *conn.Client) {
@@ -817,4 +892,15 @@ func anyToInt64(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+func optionalHashID(sha512hex string) (uint16, bool) {
+	if len(sha512hex) < 4 {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(sha512hex[:4], 16, 16)
+	if err != nil {
+		return 0, false
+	}
+	return uint16(value), true
 }

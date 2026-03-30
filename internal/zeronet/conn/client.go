@@ -2,6 +2,7 @@ package conn
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
@@ -41,6 +42,9 @@ type PeerAddress struct {
 
 // ModifiedFilesResponse 保存 listModified 结果。
 type ModifiedFilesResponse map[string]int64
+
+// Hashfield 保存 peer 宣告拥有的 optional 文件 hash id。
+type Hashfield map[uint16]struct{}
 
 // Dial 建立 TCP 连接并完成 ZeroNet v2 握手。
 func Dial(addr string) (*Client, error) {
@@ -244,6 +248,25 @@ func (c *Client) ListModified(siteAddress string, since int64) (ModifiedFilesRes
 	return decodeModifiedFiles(modifiedFiles), nil
 }
 
+// GetHashfield 读取 peer 的 optional 文件 hashfield。
+func (c *Client) GetHashfield(siteAddress string) (Hashfield, error) {
+	msg, err := c.request("getHashfield", protocol.Message{
+		"site": siteAddress,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if errText, ok := msg["error"].(string); ok && errText != "" {
+		return nil, fmt.Errorf("peer 返回 getHashfield 错误: %s", errText)
+	}
+
+	raw, ok := msg["hashfield_raw"].([]byte)
+	if !ok {
+		return nil, fmt.Errorf("getHashfield 响应缺少 hashfield_raw")
+	}
+	return decodeHashfield(raw), nil
+}
+
 func (c *Client) request(cmd string, params protocol.Message) (protocol.Message, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -383,5 +406,14 @@ func decodeModifiedFiles(raw any) ModifiedFilesResponse {
 		}
 	}
 
+	return back
+}
+
+func decodeHashfield(raw []byte) Hashfield {
+	back := make(Hashfield)
+	for i := 0; i+1 < len(raw); i += 2 {
+		hashID := binary.LittleEndian.Uint16(raw[i : i+2])
+		back[hashID] = struct{}{}
+	}
 	return back
 }
