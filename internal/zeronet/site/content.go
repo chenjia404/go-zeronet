@@ -26,6 +26,7 @@ type ContentJSON struct {
 	Files         map[string]ContentFile `json:"files"`
 	FilesOptional map[string]ContentFile `json:"files_optional"`
 	Includes      map[string]any         `json:"includes"`
+	UserContents  map[string]any         `json:"user_contents"`
 }
 
 // ParseContentJSON 解析并做第一阶段最小合法性校验。

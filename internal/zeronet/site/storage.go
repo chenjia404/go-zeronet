@@ -133,6 +133,7 @@ func (m *Manager) ensureContent(siteAddress, innerPath string) (*ContentJSON, er
 			return nil, parseErr
 		}
 		m.setCachedContent(siteAddress, innerPath, content)
+		m.preloadRelatedContents(siteAddress, innerPath, content)
 		return content, nil
 	}
 
@@ -148,6 +149,7 @@ func (m *Manager) ensureContent(siteAddress, innerPath string) (*ContentJSON, er
 		return nil, err
 	}
 	m.setCachedContent(siteAddress, innerPath, content)
+	m.preloadRelatedContents(siteAddress, innerPath, content)
 	return content, nil
 }
 
@@ -321,6 +323,7 @@ func (m *Manager) refreshContent(siteAddress, innerPath string) error {
 		return err
 	}
 	m.setCachedContent(siteAddress, innerPath, content)
+	m.preloadRelatedContents(siteAddress, innerPath, content)
 	if oldContent != nil {
 		if err := m.removeStaleContentFiles(siteAddress, innerPath, oldContent, content); err != nil {
 			return err
@@ -389,6 +392,43 @@ func (m *Manager) removeStaleContentFiles(siteAddress, contentPath string, oldCo
 		}
 	}
 	return nil
+}
+
+func (m *Manager) preloadRelatedContents(siteAddress, contentPath string, content *ContentJSON) {
+	// 显式 includes 可以直接推导出子 content.json 路径，优先预加载到缓存。
+	for relativePath := range content.Includes {
+		includePath := joinInnerPath(pathDir(contentPath), relativePath)
+		if !strings.HasSuffix(includePath, "content.json") {
+			continue
+		}
+		if _, err := m.ensureContent(siteAddress, includePath); err != nil {
+			continue
+		}
+	}
+
+	// user_contents 是盲加载规则：先扫描本地已存在的用户子目录并建立缓存。
+	if len(content.UserContents) == 0 {
+		return
+	}
+
+	contentDir := filepath.Dir(m.siteFilePath(siteAddress, contentPath))
+	entries, err := os.ReadDir(contentDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		childContentPath := joinInnerPath(pathDir(contentPath), entry.Name()+"/content.json")
+		childDiskPath := m.siteFilePath(siteAddress, childContentPath)
+		if _, err := os.Stat(childDiskPath); err != nil {
+			continue
+		}
+		if _, err := m.ensureContent(siteAddress, childContentPath); err != nil {
+			continue
+		}
+	}
 }
 
 func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) {
@@ -577,6 +617,14 @@ func nthSlash(s string, n int) int {
 
 func resolveContentFilePath(contentPath, relativePath string) string {
 	baseDir := pathDir(contentPath)
+	if baseDir == "" {
+		return relativePath
+	}
+	return baseDir + "/" + relativePath
+}
+
+func joinInnerPath(baseDir, relativePath string) string {
+	relativePath = strings.TrimPrefix(relativePath, "/")
 	if baseDir == "" {
 		return relativePath
 	}
