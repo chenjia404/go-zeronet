@@ -27,6 +27,16 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer wsConn.Close()
+	sess.mu.Lock()
+	sess.wsConn = wsConn
+	sess.mu.Unlock()
+	defer func() {
+		sess.mu.Lock()
+		if sess.wsConn == wsConn {
+			sess.wsConn = nil
+		}
+		sess.mu.Unlock()
+	}()
 
 	for {
 		var message wsMessage
@@ -99,7 +109,22 @@ func (s *Server) handleWSCommand(sess *session, message wsMessage) any {
 		if err := s.manager.WriteSiteData(sess.SiteAddress, innerPath, raw); err != nil {
 			return map[string]any{"error": err.Error()}
 		}
+		s.pushSiteInfo(sess, innerPath)
 		return "ok"
+	case "fileDelete":
+		innerPath := cleanInnerPath(stringParam(message.Params, 0, "inner_path"))
+		if err := s.manager.DeleteSiteData(sess.SiteAddress, innerPath); err != nil {
+			return map[string]any{"error": err.Error()}
+		}
+		s.pushSiteInfo(sess, innerPath)
+		return "ok"
+	case "fileList":
+		dirPath := cleanInnerPath(stringParam(message.Params, 0, "dir_inner_path"))
+		files, err := s.manager.ListSiteFiles(sess.SiteAddress, dirPath)
+		if err != nil {
+			return []string{}
+		}
+		return files
 	case "fileRules":
 		innerPath := stringParam(message.Params, 0, "inner_path")
 		return s.manager.FileRules(sess.SiteAddress, cleanInnerPath(innerPath))
@@ -168,8 +193,9 @@ func (s *Server) handleWSCommand(sess *session, message wsMessage) any {
 		if published == 0 {
 			return map[string]any{"error": "content publish failed"}
 		}
+		s.pushSiteInfo(sess, innerPathFromPublish(innerPath))
 		return "ok"
-	case "fileList", "dirList", "certSelect", "certSet", "certAdd", "certList":
+	case "dirList", "certSelect", "certSet", "certAdd", "certList":
 		return map[string]any{"error": fmt.Sprintf("%s not supported yet", message.Cmd)}
 	default:
 		return map[string]any{"error": "Unknown command: " + message.Cmd}
@@ -224,4 +250,26 @@ func queryParam(raw any) string {
 		}
 	}
 	return stringParam(raw, 0, "query")
+}
+
+func (s *Server) pushSiteInfo(sess *session, fileStatus string) {
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.wsConn == nil {
+		return
+	}
+	_ = sess.wsConn.WriteJSON(wsMessage{
+		Cmd:    "setSiteInfo",
+		Params: s.manager.SiteInfo(sess.SiteAddress, fileStatus),
+	})
+}
+
+func innerPathFromPublish(innerPath string) string {
+	if innerPath == "" || innerPath == "content.json" {
+		return "content.json"
+	}
+	return innerPath
 }

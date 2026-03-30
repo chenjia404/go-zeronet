@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -364,6 +365,47 @@ func (m *Manager) WriteSiteData(siteAddress, innerPath string, raw []byte) error
 	return nil
 }
 
+// DeleteSiteData 删除站点文件。
+func (m *Manager) DeleteSiteData(siteAddress, innerPath string) error {
+	if !m.IsOwned(siteAddress) {
+		return fmt.Errorf("站点 %s 不属于当前用户", siteAddress)
+	}
+	fullPath := m.siteFilePath(siteAddress, innerPath)
+	if err := os.Remove(fullPath); err != nil {
+		return err
+	}
+	if strings.HasSuffix(innerPath, "content.json") {
+		m.setCachedContent(siteAddress, innerPath, nil)
+	}
+	m.invalidateDB(siteAddress)
+	return nil
+}
+
+// ListSiteFiles 返回目录下的相对文件列表。
+func (m *Manager) ListSiteFiles(siteAddress, dirInnerPath string) ([]string, error) {
+	root := m.siteFilePath(siteAddress, dirInnerPath)
+	var files []string
+	err := filepath.WalkDir(root, func(pathValue string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relativePath, err := filepath.Rel(root, pathValue)
+		if err != nil {
+			return err
+		}
+		files = append(files, filepath.ToSlash(relativePath))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
 // IsOwned 返回当前节点是否持有站点私钥。
 func (m *Manager) IsOwned(siteAddress string) bool {
 	return m.store != nil && m.store.hasSite(siteAddress)
@@ -375,6 +417,14 @@ func (m *Manager) PrivateKey(siteAddress string) string {
 		return ""
 	}
 	return m.store.privateKey(siteAddress)
+}
+
+// OwnedSites 返回当前节点持有私钥的站点地址列表。
+func (m *Manager) OwnedSites() []string {
+	if m.store == nil {
+		return nil
+	}
+	return m.store.listSites()
 }
 
 func (m *Manager) listAllContentPaths(siteAddress string) ([]string, error) {

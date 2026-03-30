@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -79,4 +80,15 @@ func (s *siteStore) setPrivateKey(siteAddress, privateKey string) error {
 	s.Sites[siteAddress] = siteRecord{PrivateKey: privateKey}
 	s.mu.Unlock()
 	return s.save()
+}
+
+func (s *siteStore) listSites() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sites := make([]string, 0, len(s.Sites))
+	for address := range s.Sites {
+		sites = append(sites, address)
+	}
+	sort.Strings(sites)
+	return sites
 }

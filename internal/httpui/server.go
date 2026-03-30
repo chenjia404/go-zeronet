@@ -33,6 +33,8 @@ type session struct {
 	InnerPath    string
 	WrapperNonce string
 	AjaxKey      string
+	mu           sync.Mutex
+	wsConn       *websocket.Conn
 }
 
 // New 创建 HTTP UI 服务器。
@@ -63,7 +65,11 @@ func (s *Server) Run() error {
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/":
-		s.handleIndex(w)
+		s.handleIndex(w, r)
+	case r.URL.Path == "/ZeroNet-Internal/site/new":
+		s.handleSiteNew(w, r)
+	case r.URL.Path == "/ZeroNet-Internal/site/clone":
+		s.handleSiteClone(w, r)
 	case r.URL.Path == "/ZeroNet-Internal/Websocket":
 		s.handleWebsocket(w, r)
 	case strings.HasPrefix(r.URL.Path, "/raw/"):
@@ -75,10 +81,48 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter) {
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	setCommonHeaders(w)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("go-zeronet is running\n\nOpen /<site-address> to fetch a site.\n"))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(renderIndex(indexData{
+		OwnedSites: s.manager.OwnedSites(),
+		Created:    r.URL.Query().Get("created"),
+		Error:      r.URL.Query().Get("error"),
+	})))
+}
+
+func (s *Server) handleSiteNew(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	created, err := s.manager.CreateSite(strings.TrimSpace(r.FormValue("title")), strings.TrimSpace(r.FormValue("description")))
+	if err != nil {
+		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/?created="+url.QueryEscape(created.Address), http.StatusSeeOther)
+}
+
+func (s *Server) handleSiteClone(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	cloned, err := s.manager.CloneSite(strings.TrimSpace(r.FormValue("source")))
+	if err != nil {
+		http.Redirect(w, r, "/?error="+url.QueryEscape(err.Error()), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/?created="+url.QueryEscape(cloned.Address), http.StatusSeeOther)
 }
 
 func (s *Server) handleSite(w http.ResponseWriter, r *http.Request) {
