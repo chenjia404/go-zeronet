@@ -328,6 +328,9 @@ func (m *Manager) refreshContent(siteAddress, innerPath string) error {
 		if err := m.removeStaleContentFiles(siteAddress, innerPath, oldContent, content); err != nil {
 			return err
 		}
+		if err := m.removeArchivedUserContents(siteAddress, innerPath, oldContent, content); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -389,6 +392,53 @@ func (m *Manager) removeStaleContentFiles(siteAddress, contentPath string, oldCo
 		fullPath := m.siteFilePath(siteAddress, resolveContentFilePath(contentPath, relativePath))
 		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("删除失效文件失败 %s: %w", fullPath, err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) removeArchivedUserContents(siteAddress, contentPath string, oldContent, newContent *ContentJSON) error {
+	if len(newContent.UserContents) == 0 {
+		return nil
+	}
+
+	contentBaseDir := pathDir(contentPath)
+	oldArchived := archivedDirectories(oldContent)
+	newArchived := archivedDirectories(newContent)
+
+	// 指定目录被新归档后，清理其本地用户内容目录。
+	for relativeDir, archivedAt := range newArchived {
+		if archivedAt <= oldArchived[relativeDir] {
+			continue
+		}
+		childContentPath := joinInnerPath(contentBaseDir, relativeDir+"/content.json")
+		if m.contentModified(siteAddress, childContentPath) >= archivedAt {
+			continue
+		}
+		if err := m.removeContentTree(siteAddress, childContentPath); err != nil {
+			return err
+		}
+	}
+
+	oldArchivedBefore := archivedBefore(oldContent)
+	newArchivedBefore := archivedBefore(newContent)
+	if newArchivedBefore <= oldArchivedBefore {
+		return nil
+	}
+
+	childContents, err := m.listChildContentPaths(siteAddress, contentPath)
+	if err != nil {
+		return err
+	}
+	for _, childContentPath := range childContents {
+		if childContentPath == contentPath {
+			continue
+		}
+		if m.contentModified(siteAddress, childContentPath) > newArchivedBefore {
+			continue
+		}
+		if err := m.removeContentTree(siteAddress, childContentPath); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -637,4 +687,134 @@ func pathDir(innerPath string) string {
 		return ""
 	}
 	return innerPath[:index]
+}
+
+func archivedDirectories(content *ContentJSON) map[string]int64 {
+	if content == nil || len(content.UserContents) == 0 {
+		return nil
+	}
+
+	raw, ok := content.UserContents["archived"]
+	if !ok {
+		return nil
+	}
+
+	back := make(map[string]int64)
+	switch val := raw.(type) {
+	case map[string]any:
+		for key, item := range val {
+			back[key] = anyToInt64(item)
+		}
+	case map[string]int64:
+		for key, item := range val {
+			back[key] = item
+		}
+	case map[any]any:
+		for key, item := range val {
+			keyStr, ok := key.(string)
+			if !ok {
+				continue
+			}
+			back[keyStr] = anyToInt64(item)
+		}
+	}
+	return back
+}
+
+func archivedBefore(content *ContentJSON) int64 {
+	if content == nil || len(content.UserContents) == 0 {
+		return 0
+	}
+	return anyToInt64(content.UserContents["archived_before"])
+}
+
+func (m *Manager) listChildContentPaths(siteAddress, contentPath string) ([]string, error) {
+	contentRoot := m.siteFilePath(siteAddress, pathDir(contentPath))
+	if _, err := os.Stat(contentRoot); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var childPaths []string
+	err := filepath.WalkDir(contentRoot, func(fullPath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Name() != "content.json" {
+			return nil
+		}
+
+		relativePath, err := filepath.Rel(m.siteFilePath(siteAddress, ""), fullPath)
+		if err != nil {
+			return err
+		}
+		childPaths = append(childPaths, filepath.ToSlash(relativePath))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(childPaths)
+	return childPaths, nil
+}
+
+func (m *Manager) removeContentTree(siteAddress, contentPath string) error {
+	if contentPath == "content.json" {
+		return nil
+	}
+
+	dirPath := m.siteFilePath(siteAddress, pathDir(contentPath))
+	if err := os.RemoveAll(dirPath); err != nil {
+		return fmt.Errorf("删除归档目录失败 %s: %w", dirPath, err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	siteContents := m.contents[siteAddress]
+	if siteContents == nil {
+		return nil
+	}
+	prefix := pathDir(contentPath) + "/"
+	for innerPath := range siteContents {
+		if innerPath == contentPath || strings.HasPrefix(innerPath, prefix) {
+			delete(siteContents, innerPath)
+		}
+	}
+	return nil
+}
+
+func anyToInt64(v any) int64 {
+	switch val := v.(type) {
+	case int:
+		return int64(val)
+	case int8:
+		return int64(val)
+	case int16:
+		return int64(val)
+	case int32:
+		return int64(val)
+	case int64:
+		return val
+	case uint:
+		return int64(val)
+	case uint8:
+		return int64(val)
+	case uint16:
+		return int64(val)
+	case uint32:
+		return int64(val)
+	case uint64:
+		return int64(val)
+	case float32:
+		return int64(val)
+	case float64:
+		return int64(val)
+	default:
+		return 0
+	}
 }
