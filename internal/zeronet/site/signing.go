@@ -141,9 +141,12 @@ func (m *Manager) CloneSite(sourceAddress string) (*SiteCreation, error) {
 	if _, err := os.Stat(sourceRoot); err != nil {
 		return nil, fmt.Errorf("源站点不存在: %w", err)
 	}
+	// 先尽量补齐模板运行必需的静态文件，但这里不强依赖 peer。
+	// 如果当前没有可用 peer，后续会保留源站点的静态文件清单，访问时再按需回源。
+	_ = m.prepareCloneSource(sourceAddress)
 
 	targetRoot := filepath.Join(m.dataDir, siteAddress)
-	if err := copySiteTree(sourceRoot, targetRoot); err != nil {
+	if err := cloneSiteTree(sourceRoot, targetRoot); err != nil {
 		return nil, err
 	}
 	if err := rewriteRootContent(targetRoot, siteAddress, sourceAddress); err != nil {
@@ -155,7 +158,47 @@ func (m *Manager) CloneSite(sourceAddress string) (*SiteCreation, error) {
 	if err := m.SignAllContents(siteAddress, privateKey); err != nil {
 		return nil, err
 	}
+	if err := m.reconcileClonedRootContent(siteAddress, sourceAddress, privateKey); err != nil {
+		return nil, err
+	}
+	if err := m.initializeClonedZeroBlog(siteAddress, sourceAddress, privateKey); err != nil {
+		return nil, err
+	}
 	return &SiteCreation{Address: siteAddress, PrivateKey: privateKey}, nil
+}
+
+// prepareCloneSource 确保克隆模板需要的根文件已同步到本地，但不会拉取文章正文。
+func (m *Manager) prepareCloneSource(siteAddress string) error {
+	content, err := m.EnsureRootContent(siteAddress)
+	if err != nil {
+		return err
+	}
+
+	required := make([]string, 0, len(content.Files)+len(content.FilesOptional))
+	for relativePath := range content.Files {
+		if shouldSkipClonedContent(relativePath) {
+			continue
+		}
+		required = append(required, relativePath)
+	}
+	for relativePath := range content.FilesOptional {
+		if shouldSkipClonedContent(relativePath) {
+			continue
+		}
+		required = append(required, relativePath)
+	}
+	sort.Strings(required)
+
+	for _, relativePath := range required {
+		fullPath := m.siteFilePath(siteAddress, relativePath)
+		if _, statErr := os.Stat(fullPath); statErr == nil {
+			continue
+		}
+		if err := m.NeedFile(siteAddress, relativePath); err != nil {
+			return fmt.Errorf("同步克隆依赖 %s 失败: %w", relativePath, err)
+		}
+	}
+	return nil
 }
 
 // SignAllContents 对站点内所有 content.json 重新签名。
@@ -184,6 +227,10 @@ func (m *Manager) SignAllContents(siteAddress, privateKey string) error {
 
 // SignContent 重新生成并签名指定 content.json。
 func (m *Manager) SignContent(siteAddress, innerPath, privateKey string, extend map[string]any, removeMissingOptional bool) error {
+	return m.signContent(siteAddress, innerPath, privateKey, extend, removeMissingOptional, nil)
+}
+
+func (m *Manager) signContent(siteAddress, innerPath, privateKey string, extend map[string]any, removeMissingOptional bool, preserveMissing map[string]map[string]any) error {
 	if !strings.HasSuffix(innerPath, "content.json") {
 		return fmt.Errorf("只能签名 content.json")
 	}
@@ -224,6 +271,10 @@ func (m *Manager) SignContent(siteAddress, innerPath, privateKey string, extend 
 				}
 			}
 		}
+	}
+	if preserveMissing != nil {
+		mergeMissingManifestEntries(files, preserveMissing["files"])
+		mergeMissingManifestEntries(optionalFiles, preserveMissing["files_optional"])
 	}
 
 	newContent := cloneJSONObject(currentContent)
@@ -277,6 +328,118 @@ func (m *Manager) SignContent(siteAddress, innerPath, privateKey string, extend 
 	}
 	m.setCachedContent(siteAddress, innerPath, nil)
 	return nil
+}
+
+func mergeMissingManifestEntries(target, source map[string]any) {
+	for key, value := range source {
+		if _, exists := target[key]; !exists {
+			target[key] = value
+		}
+	}
+}
+
+func (m *Manager) reconcileClonedRootContent(siteAddress, sourceAddress, privateKey string) error {
+	preserveMissing, err := preservedCloneManifest(m.siteFilePath(sourceAddress, "content.json"))
+	if err != nil {
+		return err
+	}
+	return m.signContent(siteAddress, "content.json", privateKey, nil, true, preserveMissing)
+}
+
+func preservedCloneManifest(contentPath string) (map[string]map[string]any, error) {
+	raw, err := os.ReadFile(contentPath)
+	if err != nil {
+		return nil, err
+	}
+	var content map[string]any
+	if err := json.Unmarshal(raw, &content); err != nil {
+		return nil, err
+	}
+	return map[string]map[string]any{
+		"files":          filterCloneManifestEntries(content["files"]),
+		"files_optional": filterCloneManifestEntries(content["files_optional"]),
+	}, nil
+}
+
+func filterCloneManifestEntries(value any) map[string]any {
+	typed, ok := value.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	filtered := make(map[string]any)
+	for relativePath, fileInfo := range typed {
+		if shouldSkipClonedContent(relativePath) {
+			continue
+		}
+		filtered[relativePath] = fileInfo
+	}
+	return filtered
+}
+
+// initializeClonedZeroBlog 为 ZeroBlog 克隆站点生成一份空的 data/data.json，
+// 这样新站点首次打开后就能直接创建文章，而不会因为缺少博客数据文件而卡住。
+func (m *Manager) initializeClonedZeroBlog(siteAddress, sourceAddress, privateKey string) error {
+	schemaPath := m.siteFilePath(sourceAddress, "dbschema.json")
+	rawSchema, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return nil
+	}
+
+	var schema map[string]any
+	if err := json.Unmarshal(rawSchema, &schema); err != nil {
+		return nil
+	}
+	if dbName, _ := schema["db_name"].(string); dbName != "ZeroBlog" {
+		return nil
+	}
+
+	data := emptyZeroBlogData(siteAddress)
+	if sourceData, err := readZeroBlogDataTemplate(m.siteFilePath(sourceAddress, "data/data.json")); err == nil {
+		for _, key := range []string{"title", "description", "links", "demo"} {
+			if value, ok := sourceData[key]; ok {
+				data[key] = value
+			}
+		}
+	}
+	if data["title"] == "" {
+		if rootContent, err := m.EnsureRootContent(siteAddress); err == nil && rootContent != nil {
+			data["title"] = rootContent.Title
+		}
+	}
+
+	serialized := pythonJSONDumps(data)
+	if err := m.writeSiteFile(siteAddress, "data/data.json", []byte(serialized)); err != nil {
+		return err
+	}
+	preserveMissing, err := preservedCloneManifest(m.siteFilePath(sourceAddress, "content.json"))
+	if err != nil {
+		return err
+	}
+	return m.signContent(siteAddress, "content.json", privateKey, nil, true, preserveMissing)
+}
+
+func readZeroBlogDataTemplate(dataPath string) (map[string]any, error) {
+	raw, err := os.ReadFile(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	var data map[string]any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func emptyZeroBlogData(siteAddress string) map[string]any {
+	return map[string]any{
+		"title":        siteAddress,
+		"description":  "",
+		"links":        "",
+		"next_post_id": int64(1),
+		"demo":         false,
+		"modified":     time.Now().Unix(),
+		"post":         []any{},
+	}
 }
 
 // PublishSite 将已签名的 content.json 更新推送给已知 peer。
@@ -705,11 +868,13 @@ func rewriteRootContent(targetRoot, newAddress, sourceAddress string) error {
 	return os.WriteFile(contentPath, []byte(serialized), 0o644)
 }
 
-func copySiteTree(sourceRoot, targetRoot string) error {
+func cloneSiteTree(sourceRoot, targetRoot string) error {
 	if err := os.MkdirAll(targetRoot, 0o755); err != nil {
 		return err
 	}
-	return filepath.WalkDir(sourceRoot, func(pathValue string, entry os.DirEntry, walkErr error) error {
+	defaultFiles := make(map[string]string)
+	regularFiles := make([]string, 0)
+	err := filepath.WalkDir(sourceRoot, func(pathValue string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -720,22 +885,73 @@ func copySiteTree(sourceRoot, targetRoot string) error {
 		if relative == "." {
 			return nil
 		}
-		if strings.HasPrefix(filepath.ToSlash(relative), "data/users/") {
+		relative = filepath.ToSlash(relative)
+		if strings.HasPrefix(relative, "data/users/") {
 			return nil
 		}
-		targetPath := filepath.Join(targetRoot, relative)
 		if entry.IsDir() {
-			return os.MkdirAll(targetPath, 0o755)
+			return nil
 		}
-		raw, err := os.ReadFile(pathValue)
-		if err != nil {
-			return err
+		if shouldSkipClonedContent(relative) {
+			return nil
 		}
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-			return err
+		if strings.Contains(relative, "-default") {
+			defaultFiles[strings.ReplaceAll(relative, "-default", "")] = pathValue
+			return nil
 		}
-		return os.WriteFile(targetPath, raw, 0o644)
+		regularFiles = append(regularFiles, relative)
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	sort.Strings(regularFiles)
+	for _, relative := range regularFiles {
+		if err := copyClonedFile(filepath.Join(sourceRoot, filepath.FromSlash(relative)), filepath.Join(targetRoot, filepath.FromSlash(relative))); err != nil {
+			return err
+		}
+	}
+
+	defaultKeys := make([]string, 0, len(defaultFiles))
+	for relative := range defaultFiles {
+		defaultKeys = append(defaultKeys, relative)
+	}
+	sort.Strings(defaultKeys)
+	for _, relative := range defaultKeys {
+		targetPath := filepath.Join(targetRoot, filepath.FromSlash(relative))
+		if _, err := os.Stat(targetPath); err == nil {
+			continue
+		}
+		if err := copyClonedFile(defaultFiles[relative], targetPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func shouldSkipClonedContent(relative string) bool {
+	switch {
+	case relative == "data/data.json":
+		return true
+	case relative == "data/zeroblog.db":
+		return true
+	case strings.HasPrefix(relative, "data/img/"):
+		return true
+	default:
+		return false
+	}
+}
+
+func copyClonedFile(sourcePath, targetPath string) error {
+	raw, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(targetPath, raw, 0o644)
 }
 
 func buildStarterIndex(title, description string) string {
