@@ -19,6 +19,8 @@ Go 版 ZeroNet 重写项目。
 - `pex` 和最小多 peer
 - `listModified` 与嵌套 `content.json` 刷新
 - optional 文件的最小 hashfield 选择下载
+- `udp://`、`http(s)://`、`zero://` tracker 接入
+- 启动时从 `https://raw.githubusercontent.com/XIU2/TrackersListCollection/refs/heads/master/all.txt` 拉取 tracker 列表并合并
 - 本地站点目录与 `content.json` 索引
 - 缺文件时自动回源下载的 HTTP 静态服务
 
@@ -32,7 +34,7 @@ Go 版 ZeroNet 重写项目。
 
 ## 运行
 
-先启动一个 Python ZeroNet 节点，例如本机 `127.0.0.1:15441`。
+可以直接依赖 tracker 找 peer，也可以额外指定一个 Python ZeroNet bootstrap peer。
 
 然后运行：
 
@@ -42,6 +44,21 @@ go run ./cmd/go-zeronet \
   --ui-addr 127.0.0.1:43110 \
   --data-dir ./data
 ```
+
+如果不想依赖本地 Python 节点，也可以只用 tracker：
+
+```bash
+go run ./cmd/go-zeronet \
+  --peer '' \
+  --ui-addr 127.0.0.1:43110 \
+  --data-dir ./data
+```
+
+可选参数：
+
+- `--trackers`：手动追加/覆盖 tracker，多个用逗号分隔
+- `--disable-udp`：禁用 UDP tracker
+- `--working-shared-trackers-limit`：共享 zero tracker 上限
 
 打开：
 

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chenjia404/go-zeronet/internal/tracker"
 	"github.com/chenjia404/go-zeronet/internal/zeronet/conn"
 )
 
@@ -29,6 +30,7 @@ type Manager struct {
 	peerHashfields   map[string]conn.Hashfield
 	hashfieldFetched map[string]time.Time
 	optionalHashes   map[uint16]struct{}
+	announcer        *tracker.Announcer
 }
 
 // FileMetadata 表示某个文件条目以及它是否来自 optional 文件集合。
@@ -38,7 +40,7 @@ type FileMetadata struct {
 }
 
 // NewManager 创建站点管理器。
-func NewManager(dataDir string, peers []string) *Manager {
+func NewManager(dataDir string, peers []string, announcer *tracker.Announcer) *Manager {
 	manager := &Manager{
 		dataDir:          dataDir,
 		peerSet:          make(map[string]struct{}),
@@ -48,6 +50,7 @@ func NewManager(dataDir string, peers []string) *Manager {
 		peerHashfields:   make(map[string]conn.Hashfield),
 		hashfieldFetched: make(map[string]time.Time),
 		optionalHashes:   make(map[uint16]struct{}),
+		announcer:        announcer,
 	}
 	for _, peer := range peers {
 		manager.addPeer(peer)
@@ -96,7 +99,10 @@ func (m *Manager) OpenSiteFile(siteAddress, innerPath string) (string, error) {
 	}
 
 	if _, err := m.EnsureRootContent(siteAddress); err != nil {
-		return "", err
+		m.announceSite(siteAddress)
+		if _, retryErr := m.EnsureRootContent(siteAddress); retryErr != nil {
+			return "", retryErr
+		}
 	}
 	if _, err := m.lookupFile(siteAddress, innerPath); err != nil {
 		return "", err
@@ -172,6 +178,9 @@ func (m *Manager) refreshSite(siteAddress string) error {
 
 	// 先确保根 content.json 在本地存在，后续比较修改时间和解析 include 都依赖它。
 	_, _ = m.ensureContent(siteAddress, "content.json")
+	if len(m.peers()) == 0 {
+		m.announceSite(siteAddress)
+	}
 
 	var latestModifiedFiles conn.ModifiedFilesResponse
 	for _, peer := range m.peers() {
@@ -538,6 +547,20 @@ func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) 
 	if lastErr == nil {
 		lastErr = fmt.Errorf("没有可用 peer")
 	}
+	m.announceSite(siteAddress)
+	for _, peer := range m.peers() {
+		client, err := m.clientForPeer(peer)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		raw, err := client.GetFile(siteAddress, innerPath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return raw, nil
+	}
 	return nil, fmt.Errorf("从 peers 获取 %s 失败: %w", innerPath, lastErr)
 }
 
@@ -644,6 +667,7 @@ func (m *Manager) clientForPeer(peer string) (*conn.Client, error) {
 		return existing, nil
 	}
 	m.clients[peer] = client
+	m.discoverSharedTrackers()
 	return client, nil
 }
 
@@ -676,6 +700,26 @@ func (m *Manager) addPeer(peer string) {
 	}
 	m.peerSet[peer] = struct{}{}
 	m.peerOrder = append(m.peerOrder, peer)
+}
+
+func (m *Manager) announceSite(siteAddress string) {
+	if m.announcer == nil {
+		return
+	}
+	peers, err := m.announcer.Announce(siteAddress)
+	if err != nil {
+		return
+	}
+	for _, peer := range peers {
+		m.addPeer(peer)
+	}
+}
+
+func (m *Manager) discoverSharedTrackers() {
+	if m.announcer == nil {
+		return
+	}
+	m.announcer.DiscoverTrackersFromPeers(m.peers())
 }
 
 func (m *Manager) getPeerHashfield(peer string) (conn.Hashfield, bool) {

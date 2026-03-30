@@ -271,6 +271,31 @@ func (c *Client) GetHashfield(siteAddress string) (Hashfield, error) {
 	return decodeHashfield(raw), nil
 }
 
+// GetTrackers 读取 peer 广播的共享 zero tracker 列表。
+func (c *Client) GetTrackers() ([]string, error) {
+	msg, err := c.request("getTrackers", protocol.Message{})
+	if err != nil {
+		return nil, err
+	}
+	if errText, ok := msg["error"].(string); ok && errText != "" {
+		return nil, fmt.Errorf("peer 返回 getTrackers 错误: %s", errText)
+	}
+	items, ok := msg["trackers"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("getTrackers 响应缺少 trackers")
+	}
+	var trackers []string
+	for _, item := range items {
+		switch val := item.(type) {
+		case string:
+			trackers = append(trackers, val)
+		case []byte:
+			trackers = append(trackers, string(val))
+		}
+	}
+	return trackers, nil
+}
+
 // FindHashIDs 向 peer 查询一组 optional hash id 对应的 peer。
 func (c *Client) FindHashIDs(siteAddress string, hashIDs []uint16) (HashIDPeers, error) {
 	if len(hashIDs) == 0 {
@@ -298,6 +323,11 @@ func (c *Client) FindHashIDs(siteAddress string, hashIDs []uint16) (HashIDPeers,
 	mergeHashPeers(back, msg["peers_ipv6"], false)
 	mergeHashPeers(back, msg["peers_onion"], true)
 	return back, nil
+}
+
+// Command 发送任意 ZeroNet 命令并返回原始响应。
+func (c *Client) Command(cmd string, params protocol.Message) (protocol.Message, error) {
+	return c.request(cmd, params)
 }
 
 func (c *Client) request(cmd string, params protocol.Message) (protocol.Message, error) {

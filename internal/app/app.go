@@ -6,6 +6,7 @@ import (
 
 	"github.com/chenjia404/go-zeronet/internal/config"
 	"github.com/chenjia404/go-zeronet/internal/httpui"
+	"github.com/chenjia404/go-zeronet/internal/tracker"
 	"github.com/chenjia404/go-zeronet/internal/zeronet/conn"
 	"github.com/chenjia404/go-zeronet/internal/zeronet/site"
 )
@@ -43,10 +44,16 @@ func Run() error {
 		_ = client.Close()
 	}
 	if !reachablePeer {
-		return fmt.Errorf("没有可用的 bootstrap peer，请先确认目标 ZeroNet 正在监听 fileserver 端口")
+		log.Printf("没有可用的 bootstrap peer，将回退到 tracker 发现")
 	}
 
-	manager := site.NewManager(cfg.DataDir, cfg.Bootstrap)
+	announcer := tracker.New(tracker.Config{
+		DataDir:     cfg.DataDir,
+		Trackers:    cfg.Trackers,
+		DisableUDP:  cfg.DisableUDP,
+		SharedLimit: cfg.SharedLimit,
+	})
+	manager := site.NewManager(cfg.DataDir, cfg.Bootstrap, announcer)
 	if reachableClient != nil {
 		manager.SetClient(reachablePeerAddr, reachableClient)
 	}
@@ -54,6 +61,7 @@ func Run() error {
 
 	log.Printf("data dir: %s", cfg.DataDir)
 	log.Printf("bootstrap peers: %v", manager.BootstrapPeers())
+	log.Printf("trackers: %d", len(cfg.Trackers))
 	log.Printf("ui: http://%s/", cfg.UIAddr)
 	log.Printf("open a site: http://%s/<site-address>", cfg.UIAddr)
 
