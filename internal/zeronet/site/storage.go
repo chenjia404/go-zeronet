@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -155,48 +156,33 @@ func (m *Manager) refreshSite(siteAddress string) error {
 		return nil
 	}
 
-	currentContent, _ := m.ensureContent(siteAddress, "content.json")
-	var since int64
-	if currentContent != nil {
-		since = currentContent.Modified - 1
-	}
+	// 先确保根 content.json 在本地存在，后续比较修改时间和解析 include 都依赖它。
+	_, _ = m.ensureContent(siteAddress, "content.json")
 
-	var latestModified int64
+	var latestModifiedFiles conn.ModifiedFilesResponse
 	for _, peer := range m.peers() {
 		client, err := m.clientForPeer(peer)
 		if err != nil {
 			continue
 		}
-		modifiedFiles, err := client.ListModified(siteAddress, since)
+		modifiedFiles, err := client.ListModified(siteAddress, 0)
 		if err != nil {
 			m.dropClient(peer)
 			continue
 		}
-		if modified := modifiedFiles["content.json"]; modified > latestModified {
-			latestModified = modified
+		if len(modifiedFiles) == 0 {
+			continue
+		}
+		latestModifiedFiles = modifiedFiles
+		if modifiedFiles["content.json"] > m.contentModified(siteAddress, "content.json") {
+			break
 		}
 	}
 
-	if currentContent != nil && latestModified <= currentContent.Modified {
+	if len(latestModifiedFiles) == 0 {
 		return nil
 	}
-	if latestModified == 0 && currentContent != nil {
-		return nil
-	}
-
-	raw, err := m.fetchFromPeers(siteAddress, "content.json")
-	if err != nil {
-		return err
-	}
-	content, err := ParseContentJSON(siteAddress, "content.json", raw)
-	if err != nil {
-		return err
-	}
-	if err := m.writeSiteFile(siteAddress, "content.json", raw); err != nil {
-		return err
-	}
-	m.setCachedContent(siteAddress, "content.json", content)
-	return nil
+	return m.refreshModifiedContents(siteAddress, latestModifiedFiles)
 }
 
 func (m *Manager) lookupFile(siteAddress, innerPath string) (*ContentFile, error) {
@@ -286,6 +272,69 @@ func (m *Manager) verifyLocalFile(siteAddress, innerPath string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func (m *Manager) refreshModifiedContents(siteAddress string, modifiedFiles conn.ModifiedFilesResponse) error {
+	// 根 content.json 必须最先刷新，否则子 content.json 的 include 树可能基于旧元数据。
+	contentPaths := make([]string, 0, len(modifiedFiles))
+	for innerPath := range modifiedFiles {
+		if strings.HasSuffix(innerPath, "content.json") {
+			contentPaths = append(contentPaths, innerPath)
+		}
+	}
+	sort.Slice(contentPaths, func(i, j int) bool {
+		if contentPaths[i] == "content.json" {
+			return true
+		}
+		if contentPaths[j] == "content.json" {
+			return false
+		}
+		return contentPaths[i] < contentPaths[j]
+	})
+
+	for _, innerPath := range contentPaths {
+		if modifiedFiles[innerPath] <= m.contentModified(siteAddress, innerPath) {
+			continue
+		}
+		if err := m.refreshContent(siteAddress, innerPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) refreshContent(siteAddress, innerPath string) error {
+	raw, err := m.fetchFromPeers(siteAddress, innerPath)
+	if err != nil {
+		return err
+	}
+	content, err := ParseContentJSON(siteAddress, innerPath, raw)
+	if err != nil {
+		return err
+	}
+	if err := m.writeSiteFile(siteAddress, innerPath, raw); err != nil {
+		return err
+	}
+	m.setCachedContent(siteAddress, innerPath, content)
+	return nil
+}
+
+func (m *Manager) contentModified(siteAddress, innerPath string) int64 {
+	content := m.getCachedContent(siteAddress, innerPath)
+	if content != nil {
+		return content.Modified
+	}
+
+	raw, err := os.ReadFile(m.siteFilePath(siteAddress, innerPath))
+	if err != nil {
+		return 0
+	}
+	content, err = ParseContentJSON(siteAddress, innerPath, raw)
+	if err != nil {
+		return 0
+	}
+	m.setCachedContent(siteAddress, innerPath, content)
+	return content.Modified
 }
 
 func (m *Manager) fetchFromPeers(siteAddress, innerPath string) ([]byte, error) {
